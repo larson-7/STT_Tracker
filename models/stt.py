@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,26 +19,39 @@ def nll_loss(pred_state, pred_variance, target_state):
 
 
 class DetectionEncoder(nn.Module):
-    """
-    Encodes raw detection measurements into a high-dimensional embedding space.
-    Input: Raw detection vector (e.g., x, y, z, vx, vy, vz, ax, ay, az, sensor_type, quality).
-    Output: Detection embedding.
-    """
-
-    def __init__(self, input_dim=8, embedding_dim=256):
+    def __init__(self, input_dim=8, num_sensor_types=3, embed_dim=16, out_dim=256):
+        """
+        Encodes raw detection measurements into a high-dimensional embedding space.
+        Input: Raw detection vector (e.g., x, y, z, vx, vy, vz, ax, ay, az, quality) and Sensor ID
+        Output: Detection embedding.
+        """
         super().__init__()
-        # Simple MLP as described: Linear -> ReLU -> Linear
+
+        # Dedicated embedding for the sensor type
+        self.sensor_embedding = nn.Embedding(num_sensor_types, embed_dim)
+
+        # 2. MLP takes (geometric_features + sensor_embedding)
+        combined_dim = input_dim + embed_dim
+
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, embedding_dim),
+            nn.Linear(combined_dim, out_dim),
             nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(out_dim, out_dim),
             nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(out_dim, out_dim),
         )
 
-    def forward(self, raw_detections):
-        # raw_detections shape: [batch_size, num_detections, input_dim]
-        return self.mlp(raw_detections)
+    def forward(self, features, sensor_ids):
+        # features shape:   [..., input_dim]
+        # sensor_ids shape: [..., 1]
+
+        # Create the learnable vector for the sensor type
+        sensor_vecs = self.sensor_embedding(sensor_ids)  # shape: [..., embed_dim]
+
+        # Fuse them together, we concatenate along the last dimension (feature dimension)
+        combined = torch.cat([features, sensor_vecs], dim=-1)
+
+        return self.mlp(combined)
 
 
 class TemporalEncoder(nn.Module):
@@ -160,8 +174,82 @@ class TrackStateDecoder(nn.Module):
         return kinematics, variance
 
 
-# TODO Make STTTRacker here
-# TODO Consider padding data with nulltoken somehow for missed detects
+class STTTracker:
+    def __init__(
+        self,
+        input_dim: int = 9,
+        sensor_type_embedding_dim: int = 16,
+        num_sensor_modalities: int = 3,
+        embedding_dim: int = 256,
+    ):
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.sensor_type_embedding_dim = sensor_type_embedding_dim
+        self.num_sensor_modalities = num_sensor_modalities
+
+        self.detection_encoder = DetectionEncoder(
+            input_dim=self.input_dim,
+            num_sensor_types=num_sensor_modalities,
+            embed_dim=sensor_type_embedding_dim,
+            out_dim=self.embedding_dim,
+        )
+        self.temporal_encoder = TemporalEncoder(self.embedding_dim)
+        self.tdi_module = TrackDetectionInteraction(self.embedding_dim)
+        self.state_decoder = TrackStateDecoder(self.embedding_dim, self.input_dim)
+        # null token for timesteps with no detections
+        self.null_token = nn.Parameter(torch.randn(1, 1, 1, self.embedding_dim))
+
+        # buffer to keep track of previous track embeddings
+        self.previous_track_history: dict[str, np.ndarray] = {}
+
+    def forward(self, batch):
+        # x shape: [Batch, Seq_Len, Num_Sensor_Modalities, Feat_Dim]
+        x = batch["obs_features"]
+        # x shape: [Batch, Seq_Len, Num_Sensor_Modalities, 1]
+        sensor_ids = batch["obs_ids"]
+
+        # mask shape: [Batch, Seq_Len, Num_Sensor_Modalities]
+        # True = Real Object, False = Padding
+        mask = batch["obs_mask"]
+
+        # 1. Project features to hidden dimension
+        x_embed = self.detection_encoder(
+            features=x, sensor_ids=sensor_ids
+        )  # [Batch, Seq, Num_Sensor_Modalities, Feat_Dim]
+
+        # Expand null token to match batch size
+        # We need to broadcast self.null_token to the shape of x_embed
+        batch_size, seq_len, Num_Sensor_Modalities, _ = x_embed.shape
+        null_token_expanded = self.null_token.expand(
+            batch_size, seq_len, Num_Sensor_Modalities, -1
+        )
+
+        # Where mask is False, replace data with learnable null token
+        # We use torch.where(condition, if_true, if_false)
+        detection_embeddings = torch.where(
+            mask.unsqueeze(
+                -1
+            ),  # Expand mask to [Batch, Seq_Len, Num_Sensor_Modalities, 1] for broadcasting
+            x_embed,  # Keep original data if mask is True
+            null_token_expanded,  # Inject null token if mask is False
+        )
+
+        # create matrix of attention queries [Batch, Seq_Len * Seq_Len, Num_Sensor_Modalities, Feat_Dim]
+        track_queries = self.temporal_encoder(detection_embeddings)
+        sequence_len = x.shape[1]
+
+        # index last casual token for each timestep
+        outputs = []
+        for t in range(sequence_len):
+            q_t = track_queries[
+                :, t, :, :
+            ]  # [Batch, Seq_Len, Num_Sensor_Modalities, Feat_Dim]
+            k_v_t = detection_embeddings[:, t, :, :]  # [Batch, Num_Detections, Dim]
+
+            updated_embeddings, association_scores = self.tdi_module(
+                track_query=q_t, context_detections=k_v_t
+            )
+
 
 if __name__ == "__main__":
     # Hyperparameters
