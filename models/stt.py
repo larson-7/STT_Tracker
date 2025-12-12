@@ -1,3 +1,4 @@
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,8 +30,6 @@ class DetectionEncoder(nn.Module):
 
         # Dedicated embedding for the sensor type
         self.sensor_embedding = nn.Embedding(num_sensor_types, embed_dim)
-
-        # 2. MLP takes (geometric_features + sensor_embedding)
         combined_dim = input_dim + embed_dim
 
         self.mlp = nn.Sequential(
@@ -48,6 +47,8 @@ class DetectionEncoder(nn.Module):
         # Create the learnable vector for the sensor type
         sensor_vecs = self.sensor_embedding(sensor_ids)  # shape: [..., embed_dim]
 
+        if len(sensor_vecs.shape) > len(features.shape):
+            sensor_vecs = sensor_vecs.squeeze(1)
         # Fuse them together, we concatenate along the last dimension (feature dimension)
         combined = torch.cat([features, sensor_vecs], dim=-1)
 
@@ -121,14 +122,27 @@ class TrackDetectionInteraction(nn.Module):
         # Takes the result of interaction to decide if it was a good match
         self.association_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, track_query, context_detections):
+    def forward(
+        self,
+        track_query,
+        context_detections,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ):
         """
         track_query: [batch_size, 1, hidden_dim] (The active track)
         context_detections: [batch_size, num_context_dets, hidden_dim] (The candidates)
+        key_padding_mask: If specified, a mask of shape :math:`(N, S)` indicating which elements within ``key``
+            to ignore for the purpose of attention (i.e. treat as "padding"). For unbatched `query`, shape should be :math:`(S)`.
+            Binary and float masks are supported.
+            For a binary mask, a ``True`` value indicates that the corresponding ``key`` value will be ignored for
+            the purpose of attention. For a float mask, it will be directly added to the corresponding ``key`` value.
         """
         # Query = track_query, Key = context_detections, Value = context_detections
         attn_output, attn_weights = self.multihead_attn(
-            query=track_query, key=context_detections, value=context_detections
+            query=track_query,
+            key=context_detections,
+            value=context_detections,
+            key_padding_mask=key_padding_mask,
         )
 
         # Residual connection + Norm
@@ -174,119 +188,184 @@ class TrackStateDecoder(nn.Module):
         return kinematics, variance
 
 
-class STTTracker:
+class STTTracker(nn.Module):
     def __init__(
         self,
+        num_tracks: int = 20,
         input_dim: int = 9,
         sensor_type_embedding_dim: int = 16,
         num_sensor_modalities: int = 3,
         embedding_dim: int = 256,
+        max_history_len: int = 1000,
     ):
-        self.input_dim = input_dim
+        super().__init__()
+        self.num_tracks = num_tracks
         self.embedding_dim = embedding_dim
-        self.sensor_type_embedding_dim = sensor_type_embedding_dim
-        self.num_sensor_modalities = num_sensor_modalities
+        self.max_history_len = max_history_len
 
         self.detection_encoder = DetectionEncoder(
-            input_dim=self.input_dim,
+            input_dim=input_dim,
             num_sensor_types=num_sensor_modalities,
             embed_dim=sensor_type_embedding_dim,
-            out_dim=self.embedding_dim,
+            out_dim=embedding_dim,
         )
-        self.temporal_encoder = TemporalEncoder(self.embedding_dim)
-        self.tdi_module = TrackDetectionInteraction(self.embedding_dim)
-        self.state_decoder = TrackStateDecoder(self.embedding_dim, self.input_dim)
-        # null token for timesteps with no detections
-        self.null_token = nn.Parameter(torch.randn(1, 1, 1, self.embedding_dim))
 
-        # buffer to keep track of previous track embeddings
-        self.previous_track_history: dict[str, np.ndarray] = {}
+        self.temporal_encoder = TemporalEncoder(embedding_dim)
+        self.tdi_module = TrackDetectionInteraction(embedding_dim)
+        self.state_decoder = TrackStateDecoder(embedding_dim, input_dim)
+
+        # Learn distinct embeddings for each of the N track slots
+        # Shape: [1, Num_Tracks, Embed_Dim]
+        self.track_query_embed = nn.Parameter(torch.randn(1, num_tracks, embedding_dim))
 
     def forward(self, batch):
-        # x shape: [Batch, Seq_Len, Num_Sensor_Modalities, Feat_Dim]
-        x = batch["obs_features"]
-        # x shape: [Batch, Seq_Len, Num_Sensor_Modalities, 1]
+        features = batch["obs_features"]  # [B, Seq, Max_Dets, Dim]
         sensor_ids = batch["obs_ids"]
-
-        # mask shape: [Batch, Seq_Len, Num_Sensor_Modalities]
-        # True = Real Object, False = Padding
         mask = batch["obs_mask"]
 
-        # 1. Project features to hidden dimension
-        x_embed = self.detection_encoder(
-            features=x, sensor_ids=sensor_ids
-        )  # [Batch, Seq, Num_Sensor_Modalities, Feat_Dim]
+        batch_size, seq_len, max_dets, _ = features.shape
+        flat_feats = features.view(-1, features.shape[-1])
+        flat_ids = sensor_ids.view(-1, 1)
+        encoded_dets = self.detection_encoder(flat_feats, flat_ids)
 
-        # Expand null token to match batch size
-        # We need to broadcast self.null_token to the shape of x_embed
-        batch_size, seq_len, Num_Sensor_Modalities, _ = x_embed.shape
-        null_token_expanded = self.null_token.expand(
-            batch_size, seq_len, Num_Sensor_Modalities, -1
+        # Reshape to [Batch, Seq, Max_Detections, Embed_Dim]
+        encoded_dets = encoded_dets.view(
+            batch_size, seq_len, max_dets, self.embedding_dim
+        )
+        mask_expanded = mask.unsqueeze(-1).expand_as(encoded_dets)
+        encoded_dets = encoded_dets * mask_expanded.float()
+
+        # Expand the detections so each of the N tracks sees the scene.
+        # New Shape: [Batch * Num_Tracks, Seq, Max_Detections, Embed_Dim]
+        encoded_dets_expanded = encoded_dets.repeat_interleave(self.num_tracks, dim=0)
+        mask_expanded = mask.repeat_interleave(self.num_tracks, dim=0)
+
+        # Initialize History for ALL N tracks
+        # Queries: [Batch, Num_Tracks, Embed_Dim]
+        init_queries = self.track_query_embed.expand(batch_size, -1, -1)
+
+        # Fold into effective batch: [Batch * Num_Tracks, 1, Embed_Dim]
+        track_history = init_queries.reshape(
+            batch_size * self.num_tracks, 1, self.embedding_dim
         )
 
-        # Where mask is False, replace data with learnable null token
-        # We use torch.where(condition, if_true, if_false)
-        detection_embeddings = torch.where(
-            mask.unsqueeze(
-                -1
-            ),  # Expand mask to [Batch, Seq_Len, Num_Sensor_Modalities, 1] for broadcasting
-            x_embed,  # Keep original data if mask is True
-            null_token_expanded,  # Inject null token if mask is False
-        )
+        # Storage for outputs
+        all_kinematics = []
+        all_variances = []
+        all_association_scores = []
 
-        # create matrix of attention queries [Batch, Seq_Len * Seq_Len, Num_Sensor_Modalities, Feat_Dim]
-        track_queries = self.temporal_encoder(detection_embeddings)
-        sequence_len = x.shape[1]
+        for t in range(seq_len):
+            # Context: [Batch * Num_Tracks, Max_Detections, Embed_Dim]
+            current_context = encoded_dets_expanded[:, t, :, :]
+            current_padding_mask = ~mask_expanded[:, t, :]
 
-        # index last casual token for each timestep
-        outputs = []
-        for t in range(sequence_len):
-            q_t = track_queries[
-                :, t, :, :
-            ]  # [Batch, Seq_Len, Num_Sensor_Modalities, Feat_Dim]
-            k_v_t = detection_embeddings[:, t, :, :]  # [Batch, Num_Detections, Dim]
+            track_query = self.temporal_encoder(track_history)  # [Batch * N, Dim]
+            track_query = track_query.unsqueeze(1)  # [Batch * N, 1, Dim]
 
-            updated_embeddings, association_scores = self.tdi_module(
-                track_query=q_t, context_detections=k_v_t
+            # Each track slot attends to the same detections, but has a different query vector
+            updated_embedding, assoc_score = self.tdi_module(
+                track_query, current_context, key_padding_mask=current_padding_mask
             )
+
+            # Decode
+            kin, var = self.state_decoder(updated_embedding)
+
+            all_kinematics.append(kin.squeeze(1))
+            all_variances.append(var.squeeze(1))
+            all_association_scores.append(assoc_score.squeeze(1))
+
+            # Update History
+            track_history = torch.cat([track_history, updated_embedding], dim=1)
+            if track_history.shape[1] > self.max_history_len:
+                track_history = track_history[:, -self.max_history_len :, :]
+
+        # Unfold / Reshape Output
+        # Stack time: [Batch * Num_Tracks, Seq_Len, State_Dim]
+        kinematics_stacked = torch.stack(all_kinematics, dim=1)
+        variance_stacked = torch.stack(all_variances, dim=1)
+        scores_stacked = torch.stack(all_association_scores, dim=1)
+
+        # Reshape to separate Batch and Tracks
+        # Final Shape: [Batch, Num_Tracks, Seq_Len, State_Dim]
+        def unfold(tensor):
+            _, s_len, dim = tensor.shape
+            return tensor.view(batch_size, self.num_tracks, s_len, dim)
+
+        return {
+            "kinematics": unfold(kinematics_stacked),
+            "variance": unfold(variance_stacked),
+            "association_scores": unfold(scores_stacked),
+        }
 
 
 if __name__ == "__main__":
-    # Hyperparameters
-    HIDDEN_DIM = 256
-    INPUT_DIM = 9  # (x, y, z, x_dot, y_dot, z_dot, type)
-    STATE_DIM = 10  # (x, y, z, vx, vy, vz, ax, ay, az)
+    import torch
 
-    # Instantiate Modules
-    detection_encoder = DetectionEncoder(INPUT_DIM, HIDDEN_DIM)
-    temporal_encoder = TemporalEncoder(HIDDEN_DIM)
-    tdi_module = TrackDetectionInteraction(HIDDEN_DIM)
-    state_decoder = TrackStateDecoder(HIDDEN_DIM, STATE_DIM)
+    # Dimensions
+    BATCH_SIZE = 2  # e.g., 2 separate snippets of data (Scene A, Scene B)
+    SEQ_LEN = 5  # 5 timesteps of history provided
+    MAX_DETS = 10  # Max 10 detections per frame (some will be padding)
+    FEAT_DIM = 9  # (x, y, z, v...)
+    NUM_TRACKS = 20  # The model will output 20 track slots per scene
+    NUM_SENSORS = 3  # Radar, Camera, Lidar types
+    EMBED_DIM = 256
 
-    # Dummy Data
-    # Batch of 1 track, with 9 frames of history
-    track_history_raw = torch.randn(1, 9, INPUT_DIM)
-    # Batch of 1 track, looking at 5 nearby context detections
-    raw_context_detections = torch.randn(1, 5, INPUT_DIM)
+    print(f"--- Configuration ---")
+    print(f"Batch Size: {BATCH_SIZE}")
+    print(f"Sequence Length: {SEQ_LEN}")
+    print(f"Num Track Slots: {NUM_TRACKS}")
+    print(f"Effective Processing Batch: {BATCH_SIZE * NUM_TRACKS} (Batch * Num_Tracks)")
+    print("-" * 30)
 
-    # Encode History
-    # (In a real loop, these would already be embeddings, but we encode here for demo)
-    history_embeddings = detection_encoder(track_history_raw)
+    tracker = STTTracker(
+        num_tracks=NUM_TRACKS,
+        input_dim=FEAT_DIM,
+        num_sensor_modalities=NUM_SENSORS,
+        embedding_dim=EMBED_DIM,
+    )
 
-    # Temporal Fusion -> Get Track Query
-    track_query = temporal_encoder(history_embeddings)  # Shape: [1, 256]
-    track_query = track_query.unsqueeze(1)  # Shape: [1, 1, 256] for Attention
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tracker.to(device)
+    print(f"Model created on device: {device}\n")
 
-    # Encode Current Context Detections
-    context_detections = detection_encoder(raw_context_detections)  # Shape: [1, 5, 256]
+    # Random kinematic features: [Batch, Seq, Max_Dets, Feat_Dim]
+    obs_features = torch.randn(BATCH_SIZE, SEQ_LEN, MAX_DETS, FEAT_DIM).to(device)
 
-    # TDI Interaction
-    updated_embedding, association_scores = tdi_module(track_query, context_detections)
+    # Random sensor IDs (0, 1, or 2): [Batch, Seq, Max_Dets, 1]
+    obs_ids = torch.randint(0, NUM_SENSORS, (BATCH_SIZE, SEQ_LEN, MAX_DETS, 1)).to(
+        device
+    )
 
-    # Decode State
-    current_state, current_variance = state_decoder(updated_embedding)
+    # Random Mask: [Batch, Seq, Max_Dets]
+    # Let's say ~30% are "False" (padding/empty slots), 70% are "True" (real detections)
+    obs_mask = (torch.rand(BATCH_SIZE, SEQ_LEN, MAX_DETS) > 0.3).to(device)
 
-    print(f"Track Query Shape: {track_query.shape}")
-    print(f"Association Scores: {association_scores.item():.4f}")
-    print(f"Predicted State (x, y, z, v...): {current_state.detach().numpy()}")
-    print(f"Predicted Variance (x, y, z, v...): {current_variance.detach().numpy()}")
+    # Pack into dictionary
+    batch = {"obs_features": obs_features, "obs_ids": obs_ids, "obs_mask": obs_mask}
+
+    print("Running Forward Pass...")
+    outputs = tracker(batch)
+
+    kinematics = outputs["kinematics"]
+    variance = outputs["variance"]
+    scores = outputs["association_scores"]
+
+    print("\n--- Output Shapes ---")
+    print(f"Kinematics: {kinematics.shape}")
+    # Expect: [Batch, Num_Tracks, Seq_Len, Out_Dim]
+
+    print(f"Variance:   {variance.shape}")
+    # Expect: [Batch, Num_Tracks, Seq_Len, Out_Dim]
+
+    print(f"Scores:     {scores.shape}")
+    # Expect: [Batch, Num_Tracks, Seq_Len, 1]
+
+    assert kinematics.shape[0] == BATCH_SIZE
+    assert kinematics.shape[1] == NUM_TRACKS
+    assert kinematics.shape[2] == SEQ_LEN
+
+    # Example: Check the score of the 1st track in the 1st batch at the last timestep
+    last_frame_score = scores[0, 0, -1, 0].item()
+    print(
+        f"Sample Association Score (Batch 0, Track 0, Final Frame): {last_frame_score:.4f}"
+    )
