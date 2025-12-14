@@ -49,7 +49,7 @@ def ensure_dir(directory):
         os.makedirs(directory)
 
 
-# --- 1. Ownship Generation ---
+# --- Ownship Generation ---
 def generate_ownship_path(
     start_time: datetime, duration: int
 ) -> Tuple[GroundTruthPath, str]:
@@ -106,7 +106,7 @@ def generate_ownship_path(
     return path, scenario_type
 
 
-# --- 2. Target Scenario Generation ---
+# --- Target Scenario Generation ---
 def generate_random_scenario(
     start_time: datetime, duration: int
 ) -> List[GroundTruthPath]:
@@ -155,7 +155,7 @@ def generate_random_scenario(
     return ground_truths
 
 
-# --- 3. Geometric Probability Calculation ---
+# --- Geometric Probability Calculation ---
 def get_detection_probability(
     ownship_state: State, target_state: State, base_prob: float
 ) -> float:
@@ -177,18 +177,18 @@ def get_detection_probability(
     angle_rad = np.arccos(np.clip(dot / (mag_o * mag_t), -1.0, 1.0))
     angle_deg = np.degrees(np.abs(angle_rad))
 
-    # 1. Blind Spot
+    # Blind Spot
     if angle_deg > 90:
         return 0.0
-    # 2. Edge of Envelope
+    # Edge of Envelope
     elif 40 < angle_deg < 55:
         return 0.40
-    # 3. Nominal
+    # Nominal
     else:
         return base_prob
 
 
-# --- 4. Tracker Components ---
+# --- Tracker Components ---
 def create_sensor_tracker_components(measurement_model):
     predictor = KalmanPredictor(
         CombinedLinearGaussianTransitionModel(
@@ -224,7 +224,7 @@ def create_sensor_tracker_components(measurement_model):
     }
 
 
-# --- 5. Simulation Runner ---
+# --- Simulation Runner ---
 def run_episode(
     episode_id, start_time, duration
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

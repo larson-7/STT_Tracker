@@ -54,16 +54,21 @@ class TrackingDataset(Dataset):
         # Mask: False (0) = Padding, True (1) = Real Data
         mask_tensor = torch.zeros((self.seq_len, self.max_objs), dtype=torch.bool)
 
-        # We also pad IDs to keep alignment (-1 usually denotes no-object in ID lists)
+        # TODO: maybe have to make this 0
+        # Pad IDs to keep alignment (-1 usually denotes no-object in ID lists)
         truth_id_tensor = torch.full(
             (self.seq_len, self.max_objs), -1, dtype=torch.long
         )
+        truth_states_tensor = torch.zeros(
+            (self.seq_len, self.max_objs, self.feature_dim), dtype=torch.float32
+        )
+
         sensor_id_tensor = torch.zeros((self.seq_len, self.max_objs), dtype=torch.long)
 
         batched_own = []
 
         for t, f_idx in enumerate(frame_seq):
-            # 1. Get Observations
+            # Get observations
             curr_tracks = self.tracks_df[
                 (self.tracks_df["episode_id"] == ep_id)
                 & (self.tracks_df["frame_idx"] == f_idx)
@@ -87,9 +92,33 @@ class TrackingDataset(Dataset):
                 ]
             ].values
 
+            truth_states = self.truth_df[
+                (self.truth_df["episode_id"] == ep_id)
+                & (self.truth_df["frame_idx"] == f_idx)
+            ]
+
+            # Truth Features
+            truth_feats = truth_states[
+                [
+                    "object_id",
+                    "x",
+                    "y",
+                    "z",
+                    "vx",
+                    "vy",
+                    "vz",
+                    "ax",
+                    "ay",
+                    "az",
+                    "var_x",
+                    "var_y",
+                    "var_z",
+                ]
+            ].values
+
             # Truncate if we have more tracks than max_objs
             num_objs = min(len(feats), self.max_objs)
-
+            truth_states_tensor[t, :] = torch.from_numpy(truth_feats)
             if num_objs > 0:
                 # Fill the fixed tensor slots
                 obs_tensor[t, :num_objs, :] = torch.from_numpy(
@@ -106,7 +135,7 @@ class TrackingDataset(Dataset):
                 sensor_ids = curr_tracks["sensor_id"].values.astype(np.int64)
                 sensor_id_tensor[t, :num_objs] = torch.from_numpy(sensor_ids[:num_objs])
 
-            # 2. Ownship (Standard handling)
+            # Ownship (Standard handling)
             curr_own = self.own_df[
                 (self.own_df["episode_id"] == ep_id)
                 & (self.own_df["frame_idx"] == f_idx)
@@ -120,11 +149,12 @@ class TrackingDataset(Dataset):
             else:
                 own_feats = np.zeros(6, dtype=np.float32)
             batched_own.append(torch.tensor(own_feats))
-
         return {
             "obs_features": obs_tensor,  # Shape: [seq_len, max_objs, 12]
+            "obs_ids": sensor_id_tensor,  # Shape: [seq_len, max_obs, 1]
             "obs_mask": mask_tensor,  # Shape: [seq_len, max_objs]
             "truth_ids": truth_id_tensor,  # Shape: [seq_len, max_objs]
+            "truth_states": truth_states_tensor,  # Shape [seq_len, n_objs, 12]
             "ownship": torch.stack(batched_own),
         }
 

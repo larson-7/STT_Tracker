@@ -1,13 +1,9 @@
 from typing import Optional
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-# TODO: Positional encoding, null-detects, multi-modal, context length, casual mask?
-# database of local tracks stored based on their local track id
 
 
+# TODO: Incorporate this for variance predictions
 def nll_loss(pred_state, pred_variance, target_state):
     """
     Used to guide log varaiance prediction.
@@ -71,6 +67,7 @@ class TemporalEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
+        # TODO: positional offset here
 
     def forward(self, track_history):
         """
@@ -105,7 +102,7 @@ class TrackDetectionInteraction(nn.Module):
 
     def __init__(self, hidden_dim=256, nhead=4):
         super().__init__()
-        # Cross-Attention: Query is Track, Key/Value are Detections
+        # Query is Track, Key/Value are Detections
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=nhead, batch_first=True
         )
@@ -153,6 +150,7 @@ class TrackDetectionInteraction(nn.Module):
         # Predict Association Scores (Logits for binary classification/ranking)
         association_scores = self.association_head(updated_embedding)
 
+        # TODO: Need to threshold distance here to help runtime/memory
         # TODO: Should I add an additional MLP decoder here instead of using TrackStateDecoder???
         return updated_embedding, association_scores
 
