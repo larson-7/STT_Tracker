@@ -1,18 +1,18 @@
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import numpy as np
 
 
 class TrackingDataset(Dataset):
-    def __init__(self, track_file, truth_file, ownship_file, seq_len=5, max_objs=50):
+    def __init__(self, track_file, truth_file, ownship_file, seq_len=5, max_objs=3):
         """
         Args:
             max_objs: Fixed size to pad observations to (required for learnable tokens).
         """
         self.seq_len = seq_len
         self.max_objs = max_objs
-        self.feature_dim = 12  # x, y, z, vx, vy, vz, ax, ay, az, var_x, var_y, var_z
+        self.feature_dim = 9  # x, y, z, vx, vy, vz, ax, ay, az
 
         # Load Data
         self.tracks_df = pd.read_csv(track_file)
@@ -86,9 +86,6 @@ class TrackingDataset(Dataset):
                     "ax",
                     "ay",
                     "az",
-                    "var_x",
-                    "var_y",
-                    "var_z",
                 ]
             ].values
 
@@ -100,7 +97,6 @@ class TrackingDataset(Dataset):
             # Truth Features
             truth_feats = truth_states[
                 [
-                    "object_id",
                     "x",
                     "y",
                     "z",
@@ -110,9 +106,6 @@ class TrackingDataset(Dataset):
                     "ax",
                     "ay",
                     "az",
-                    "var_x",
-                    "var_y",
-                    "var_z",
                 ]
             ].values
 
@@ -157,8 +150,3 @@ class TrackingDataset(Dataset):
             "truth_states": truth_states_tensor,  # Shape [seq_len, n_objs, 12]
             "ownship": torch.stack(batched_own),
         }
-
-
-def collate_fn(batch):
-    # Custom collate because observations are variable length per frame
-    return batch

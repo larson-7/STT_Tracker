@@ -220,6 +220,7 @@ class STTTracker(nn.Module):
         features = batch["obs_features"]  # [B, Seq, Max_Dets, Dim]
         sensor_ids = batch["obs_ids"]
         mask = batch["obs_mask"]
+        # TODO: incorporate ownship position, run through encoder, stack and cross attend before TDI module?
 
         batch_size, seq_len, max_dets, _ = features.shape
         flat_feats = features.view(-1, features.shape[-1])
