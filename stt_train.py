@@ -1,12 +1,9 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from stt_data_loader import TrackingDataset
-from models.stt import (
-    STTTracker,
-)
-import torch.optim as optim
 from scipy.optimize import linear_sum_assignment
+from torch.utils.data import DataLoader
+from models.stt import STTTracker
+from stt_data_loader import TrackingDataset
 
 
 def train_one_epoch(model, loader, optimizer, device):
@@ -14,72 +11,95 @@ def train_one_epoch(model, loader, optimizer, device):
     total_loss = 0
 
     for batch_idx, batch_data in enumerate(loader):
-        # A batch is a list of sequences (batch_size items)
-        # Each item is a dict with 'observations', 'ground_truth', 'ownship' lists
-        batch_size, seq_size, num_sensor_types = batch_data["truth_ids"].shape
-        # Process sequence frame by frame
+        # Forward Pass
+        # outputs["kinematics"]: [batch, num_tracks, seq_len, output_dim]
+        # outputs["association_scores"]: [batch, num_tracks, seq_len, 1]
         outputs = model(batch_data)
-        kinematics = outputs["kinematics"]
-        variance = outputs["variance"]
+
+        pred_states = outputs["kinematics"]
         pred_logits = outputs["association_scores"]
 
-        # Loss Calculation
-        # Association Loss (L_d) = -(ylog(AS_i) + (1 - y)log(1 - AS_i))
-        # where y is the ground truth association, 1 if associated or 0 if not
-        target_cls = torch.zeros(batch_size, model.num_tracks, seq_size, 1).to(device)
-        # TODO: truth_ids doesn't seem right, should be a tensor that is batch, seq, truth_id ... oh we can have mutliple measurements per timestep so maybe this is right
-        target_cls[p_indices] = 1.0
+        # Ground Truth Data
+        # gt_states is [batch, seq_len, max_gt_objects, output_dim]
+        # Assuming truth_mask is [batch, seq_len, max_gt_objects] (1 if valid object, 0 if padding)
+        gt_states = batch_data["truth_states"].to(device)
+        gt_mask = batch_data["truth_mask"].to(device)
 
-        loss_cls = F.binary_cross_entropy_with_logits(
-            pred_logits.squeeze(0), target_cls
-        )
-        # Need to match Predicted Tracks (M) to Ground Truth (N)
-        truth_ids = batch_data["truth_ids"]
-        gt_states = batch_data["truth_states"]
+        batch_loss_cls = 0
+        batch_loss_box = 0
 
-        # Cost Matrix: L1 distance between Pred State and GT State
-        # pred_states: [batch_size, M, obs_dim], gt_states: [N, obs_dim]
-        p_s = kinematics.squeeze(0)  # [M, obs_dim]
-        cost_dist = torch.cdist(p_s, gt_states, p=1)  # [M, N]
+        batch_size, num_queries, seq_len, _ = pred_logits.shape
 
-        # Cost Class: Probability of "Not Object"
-        # If we want tracks to persist, we reward matching specific IDs
+        for b in range(batch_size):
+            for t in range(seq_len):
 
-        # Hungarian Match
-        p_indices, g_indices = linear_sum_assignment(cost_dist.cpu().detach().numpy())
+                # Get predictions for this specific frame
+                # p_state: [num_queries, obs_dim]
+                # p_score: [num_queries, 1]
+                p_state = pred_states[b, :, t]
+                p_score = pred_logits[b, :, t]
 
-        # Association Loss (L_d)
-        # Matched tracks should have score 1, others 0
-        target_cls = torch.zeros(model.num_tracks, 1).to(device)
-        target_cls[p_indices] = 1.0
+                # Get valid Ground Truths for this frame
+                # Filter out padding using the mask
+                valid_indices = gt_mask[b, t] > 0
+                g_box = gt_states[b, t][valid_indices]  # [num_actual_objs, obs_dim]
 
-        loss_cls = F.binary_cross_entropy_with_logits(
-            pred_logits.squeeze(0), target_cls
-        )
+                if len(g_box) == 0:
+                    # If no GT objects exist in this frame, all preds should be background (0)
+                    target_cls = torch.zeros_like(p_score)
+                    loss_cls = F.binary_cross_entropy_with_logits(p_score, target_cls)
+                    batch_loss_cls += loss_cls
+                    continue
 
-        # Calculate Losses
-        loss_state = 0
-        loss_cls = 0
+                # Compute Cost Matrix (on CPU for Scipy)
+                # Cost = Classification Cost + Position Cost
+                # We want to match preds that are confident AND close to the GT
 
-        # Matches
-        matched_preds = p_s[p_indices]
-        matched_gts = gt_states[g_indices]
-        loss_state = F.l1_loss(matched_preds, matched_gts)
+                # L1 Distance Cost
+                cost_dist = torch.cdist(p_state, g_box, p=1).detach().cpu()
 
-        # Combined Loss
-        step_loss = loss_state * 5.0 + loss_cls
+                # Prob Cost:
+                # Penalize if the model is confident but wrong
+                # specific implementation depends on if p_score is sigmoid or raw logits
+                out_prob = p_score.sigmoid().detach().cpu()
+                cost_class = -out_prob.matmul(torch.ones(len(g_box), 1).T.cpu())
 
-        # Backprop (Truncated BPTT usually, but here we do per step or per seq)
+                # Final Cost Matrix
+                C = cost_dist + cost_class
+
+                # 4. Hungarian Matching
+                # row_idx -> indices of predicted tracks
+                # col_idx -> indices of ground truth objects
+                row_idx, col_idx = linear_sum_assignment(C.numpy())
+
+                # Build Classification Targets
+                # Initialize all targets to 0 (Background)
+                target_cls = torch.zeros_like(p_score)
+                # Set matched tracks to 1 (Object)
+                target_cls[row_idx] = 1.0
+
+                # Calculate Losses
+                # We want the matched indices to predict 1, everyone else 0
+                loss_cls = F.binary_cross_entropy_with_logits(p_score, target_cls)
+
+                # State Prediction Loss (L1) - Only for matched pairs
+                matched_p_box = p_state[row_idx]
+                matched_g_box = g_box[col_idx]
+                loss_box = F.l1_loss(matched_p_box, matched_g_box)
+
+                # Accumulate
+                batch_loss_cls += loss_cls
+                batch_loss_box += loss_box
+
+        # Average loss over the batch/sequence
+        total_steps = batch_size * seq_len
+        final_loss = (batch_loss_cls + batch_loss_box * 5.0) / total_steps
+
         optimizer.zero_grad()
-        step_loss.backward(retain_graph=True)  # Retain graph for sequence BPTT
+        final_loss.backward()
         optimizer.step()
 
-        total_loss += step_loss.item()
-
-        # Update states/memory for next frame
-        # Detach to prevent gradients exploding over long sequences unless using TBPTT
-        curr_states = pred_states.detach()
-        curr_embeds = output_embeds.detach()
+        total_loss += final_loss.item()
 
     return total_loss / len(loader)
 
@@ -106,7 +126,7 @@ if __name__ == "__main__":
         embedding_dim=256,
         max_history_len=100,
     ).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     print("Starting Training...")
     for epoch in range(10):

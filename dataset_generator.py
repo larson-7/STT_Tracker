@@ -108,7 +108,9 @@ def generate_ownship_path(
 
 # --- Target Scenario Generation ---
 def generate_random_scenario(
-    start_time: datetime, duration: int
+    start_time: datetime,
+    duration: int,
+    max_num_objects: int,
 ) -> List[GroundTruthPath]:
     transition_model = CombinedLinearGaussianTransitionModel(
         [
@@ -118,7 +120,7 @@ def generate_random_scenario(
         ]
     )
 
-    num_targets = np.random.randint(2, 5)
+    num_targets = np.random.randint(1, max_num_objects)
     ground_truths = []
 
     for i in range(num_targets):
@@ -226,7 +228,10 @@ def create_sensor_tracker_components(measurement_model):
 
 # --- Simulation Runner ---
 def run_episode(
-    episode_id, start_time, duration
+    episode_id,
+    start_time,
+    duration,
+    max_num_objects,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     mapping = (0, 3, 6)
 
@@ -245,7 +250,7 @@ def run_episode(
         models[name] = LinearGaussian(ndim_state=9, mapping=mapping, noise_covar=mat)
         trackers[name] = create_sensor_tracker_components(models[name])
 
-    ground_truths = generate_random_scenario(start_time, duration)
+    ground_truths = generate_random_scenario(start_time, duration, max_num_objects)
     gt_path_map = {path: i for i, path in enumerate(ground_truths)}
     ownship_path, scenario_type = generate_ownship_path(start_time, duration)
 
@@ -403,6 +408,7 @@ def run_episode(
 def main():
     ensure_dir(OUTPUT_DIR)
     start_time = datetime.now().replace(microsecond=0)
+    max_num_objects = 3
 
     # --- FORMAT SPECIFICATIONS ---
     # These lists enforce the output types for CSV saving.
@@ -425,7 +431,7 @@ def main():
     print(f"Generating {TRAIN_SAMPLES} Training Episodes...")
     t_tracks, t_gt, t_own = [], [], []
     for i in tqdm(range(TRAIN_SAMPLES)):
-        tracks, gt, own = run_episode(i, start_time, DURATION_FRAMES)
+        tracks, gt, own = run_episode(i, start_time, DURATION_FRAMES, max_num_objects)
         t_tracks.append(tracks)
         t_gt.append(gt)
         t_own.append(own)
@@ -459,7 +465,9 @@ def main():
     print(f"Generating {VAL_SAMPLES} Validation Episodes...")
     v_tracks, v_gt, v_own = [], [], []
     for i in tqdm(range(VAL_SAMPLES)):
-        tracks, gt, own = run_episode(i + 1000, start_time, DURATION_FRAMES)
+        tracks, gt, own = run_episode(
+            i + 1000, start_time, DURATION_FRAMES, max_num_objects
+        )
         v_tracks.append(tracks)
         v_gt.append(gt)
         v_own.append(own)
