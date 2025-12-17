@@ -51,6 +51,9 @@ def train_one_epoch(model, loader, optimizer, device):
                     batch_loss_cls += loss_cls
                     continue
 
+                # Association Loss (L_d):
+                # l_d = -(y * log(AS_i) + (1 - y) * log(1 - AS_i))
+
                 # Compute Cost Matrix (on CPU for Scipy)
                 # Cost = Classification Cost + Position Cost
                 # We want to match preds that are confident AND close to the GT

@@ -148,7 +148,7 @@ class TrackDetectionInteraction(nn.Module):
         updated_embedding = updated_embedding + self.ffn(updated_embedding)
 
         # Predict Association Scores (Logits for binary classification/ranking)
-        association_scores = self.association_head(updated_embedding)
+        association_scores = attn_weights
 
         # TODO: Need to threshold distance here to help runtime/memory
         # TODO: Should I add an additional MLP decoder here instead of using TrackStateDecoder???
