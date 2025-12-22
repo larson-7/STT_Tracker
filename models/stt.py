@@ -1,6 +1,7 @@
 from typing import Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # TODO: Incorporate this for variance predictions
@@ -93,21 +94,38 @@ class TemporalEncoder(nn.Module):
 
 class TrackDetectionInteraction(nn.Module):
     """
-    The TDI Module.
-    Performs Cross-Attention between the 'track_query' and 'context_detections'.
-    Outputs:
-      1. Updated track embedding (fused with best detection info).
-      2. Association scores (classification logits).
+    "White Box" Transformer Attention Block.
+
+    Performs Cross-Attention between 'track_query' and 'context_detections'.
+    Unlike standard nn.MultiheadAttention, this exposes the raw attention logits
+    (pre-softmax) for Association Loss (L_d) and the normalized probabilities
+    for inference-time matching.
+
+    Outputs (Tuple):
+      1. Updated track embedding (fused with detection info).
+      2. Association logits (raw scores, for Loss calculation).
+      3. Association probabilities (Sigmoid scores, for Inference matching).
     """
 
-    def __init__(self, hidden_dim=256, nhead=4):
+    def __init__(self, hidden_dim: int = 256, nhead: int = 4):
         super().__init__()
-        # Query is Track, Key/Value are Detections
-        self.multihead_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=nhead, batch_first=True
-        )
+        self.nhead = nhead
+        self.head_dim = hidden_dim // nhead
+        self.scale = self.head_dim**-0.5
 
-        # MLP for normalization/processing after attention (standard Transformer block)
+        assert (
+            self.head_dim * nhead == hidden_dim
+        ), "Hidden dim must be divisible by nhead"
+
+        # Q, K, V Projections (Shared by Loss AND State Update)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Output projection for the state update path
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Standard Transformer Block components
         self.norm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -115,44 +133,79 @@ class TrackDetectionInteraction(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Association Score Predictor
-        # Takes the result of interaction to decide if it was a good match
-        self.association_head = nn.Linear(hidden_dim, 1)
-
     def forward(
         self,
-        track_query,
-        context_detections,
+        track_query: torch.Tensor,
+        context_detections: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        track_query: [batch_size, 1, hidden_dim] (The active track)
-        context_detections: [batch_size, num_context_dets, hidden_dim] (The candidates)
-        key_padding_mask: If specified, a mask of shape :math:`(N, S)` indicating which elements within ``key``
-            to ignore for the purpose of attention (i.e. treat as "padding"). For unbatched `query`, shape should be :math:`(S)`.
-            Binary and float masks are supported.
-            For a binary mask, a ``True`` value indicates that the corresponding ``key`` value will be ignored for
-            the purpose of attention. For a float mask, it will be directly added to the corresponding ``key`` value.
+        Args:
+            track_query: [Batch, Num_Tracks, Dim]
+                The active track embeddings.
+            context_detections: [Batch, Num_Dets, Dim]
+                The candidate detections for this frame.
+            key_padding_mask: [Batch, Num_Dets]
+                True indicates the index is padding and should be ignored.
+
+        Returns:
+            updated_embedding: [Batch, Num_Tracks, Dim]
+                The track states updated with information from relevant detections.
+            association_logits: [Batch, Num_Tracks, Num_Dets]
+                Raw similarity scores (logits) averaged across heads.
+                Use this with BCEWithLogitsLoss.
+            association_probs: [Batch, Num_Tracks, Num_Dets]
+                Sigmoid-normalized probabilities (0.0 to 1.0).
+                Use this for Hungarian Matching or Thresholding during inference.
         """
-        # Query = track_query, Key = context_detections, Value = context_detections
-        attn_output, attn_weights = self.multihead_attn(
-            query=track_query,
-            key=context_detections,
-            value=context_detections,
-            key_padding_mask=key_padding_mask,
+        B, N_tracks, C = track_query.shape
+        _, N_dets, _ = context_detections.shape
+
+        # Reshape to [Batch, Num_Elements, Num_Heads, Head_Dim] -> Transpose to [B, Heads, N, Head_Dim]
+        q = (
+            self.q_proj(track_query)
+            .view(B, N_tracks, self.nhead, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(context_detections)
+            .view(B, N_dets, self.nhead, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(context_detections)
+            .view(B, N_dets, self.nhead, self.head_dim)
+            .transpose(1, 2)
         )
 
-        # Residual connection + Norm
-        # This 'updated_embedding' contains information from the attended detections
-        updated_embedding = self.norm(track_query + attn_output)
+        # Matrix Mult: (B, Heads, N_tracks, Head_Dim) @ (B, Heads, Head_Dim, N_dets)
+        # Output: [B, Heads, N_tracks, N_dets]
+        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, N_dets] -> Expand to [B, 1, 1, N_dets]
+            mask_expanded = key_padding_mask.view(B, 1, 1, N_dets)
+            attn_logits = attn_logits.masked_fill(mask_expanded, float("-inf"))
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
+
+        # Weighted sum of Values: [B, Heads, N_tracks, Head_Dim]
+        out = attn_weights @ v
+
+        # Reassemble Heads: [B, N_tracks, Hidden_Dim]
+        out = out.transpose(1, 2).contiguous().view(B, N_tracks, C)
+
+        # Final Projection, Residual, and FFN
+        out = self.out_proj(out)
+        updated_embedding = self.norm(track_query + out)
         updated_embedding = updated_embedding + self.ffn(updated_embedding)
 
-        # Predict Association Scores (Logits for binary classification/ranking)
-        association_scores = attn_weights
+        # Sigmoid association scores used during inference
+        # We allow the model to predict "0" for everything if no match exists
+        mean_association_logits = attn_logits.mean(dim=1)
+        association_probs = mean_association_logits.sigmoid()
 
-        # TODO: Need to threshold distance here to help runtime/memory
-        # TODO: Should I add an additional MLP decoder here instead of using TrackStateDecoder???
-        return updated_embedding, association_scores
+        return updated_embedding, mean_association_logits, association_probs
 
 
 class TrackStateDecoder(nn.Module):
@@ -210,7 +263,8 @@ class STTTracker(nn.Module):
 
         self.temporal_encoder = TemporalEncoder(embedding_dim)
         self.tdi_module = TrackDetectionInteraction(embedding_dim)
-        self.state_decoder = TrackStateDecoder(embedding_dim, input_dim)
+        self.prior_state_decoder = TrackStateDecoder(embedding_dim, input_dim)
+        self.posterior_state_decoder = TrackStateDecoder(embedding_dim, input_dim)
 
         # Learn distinct embeddings for each of the N track slots
         # Shape: [1, Num_Tracks, Embed_Dim]
@@ -249,8 +303,10 @@ class STTTracker(nn.Module):
         )
 
         # Storage for outputs
-        all_kinematics = []
-        all_variances = []
+        all_prior_kinematics = []
+        all_prior_variances = []
+        all_posterior_kinematics = []
+        all_posterior_variances = []
         all_association_scores = []
 
         for t in range(seq_len):
@@ -261,16 +317,23 @@ class STTTracker(nn.Module):
             track_query = self.temporal_encoder(track_history)  # [Batch * N, Dim]
             track_query = track_query.unsqueeze(1)  # [Batch * N, 1, Dim]
 
+            prior_kin, prior_var = self.prior_state_decoder(track_query)
+
+            # TODO gate queries based on prior_kin (maybe var too via BD distance?) with the tracks and detections
+
             # Each track slot attends to the same detections, but has a different query vector
-            updated_embedding, assoc_score = self.tdi_module(
+            updated_embedding, assoc_score, _ = self.tdi_module(
                 track_query, current_context, key_padding_mask=current_padding_mask
             )
 
             # Decode
-            kin, var = self.state_decoder(updated_embedding)
-
-            all_kinematics.append(kin.squeeze(1))
-            all_variances.append(var.squeeze(1))
+            posterior_kin, posterior_var = self.posterior_state_decoder(
+                updated_embedding
+            )
+            all_prior_kinematics.append(prior_kin.squeeze(1))
+            all_prior_variances.append(prior_var.squeeze(1))
+            all_posterior_kinematics.append(posterior_kin.squeeze(1))
+            all_posterior_variances.append(posterior_var.squeeze(1))
             all_association_scores.append(assoc_score.squeeze(1))
 
             # Update History
@@ -280,8 +343,10 @@ class STTTracker(nn.Module):
 
         # Unfold / Reshape Output
         # Stack time: [Batch * Num_Tracks, Seq_Len, State_Dim]
-        kinematics_stacked = torch.stack(all_kinematics, dim=1)
-        variance_stacked = torch.stack(all_variances, dim=1)
+        prior_kinematics_stacked = torch.stack(all_prior_kinematics, dim=1)
+        prior_variances_stacked = torch.stack(all_prior_variances, dim=1)
+        posterior_kinematics_stacked = torch.stack(all_posterior_kinematics, dim=1)
+        posterior_variance_stacked = torch.stack(all_posterior_variances, dim=1)
         scores_stacked = torch.stack(all_association_scores, dim=1)
 
         # Reshape to separate Batch and Tracks
@@ -291,8 +356,10 @@ class STTTracker(nn.Module):
             return tensor.view(batch_size, self.num_tracks, s_len, dim)
 
         return {
-            "kinematics": unfold(kinematics_stacked),
-            "variance": unfold(variance_stacked),
+            "prior_kinematics": unfold(prior_kinematics_stacked),
+            "prior_variance": unfold(prior_variances_stacked),
+            "posterior_kinematics": unfold(posterior_kinematics_stacked),
+            "posterior_variance": unfold(posterior_variance_stacked),
             "association_scores": unfold(scores_stacked),
         }
 

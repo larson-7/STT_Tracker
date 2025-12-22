@@ -6,7 +6,7 @@ from models.stt import STTTracker
 from stt_data_loader import TrackingDataset
 
 
-def train_one_epoch(model, loader, optimizer, device):
+def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities):
     model.train()
     total_loss = 0
 
@@ -17,82 +17,68 @@ def train_one_epoch(model, loader, optimizer, device):
         outputs = model(batch_data)
 
         pred_states = outputs["kinematics"]
-        pred_logits = outputs["association_scores"]
+        pred_assoc_logits = outputs["association_scores"]
 
         # Ground Truth Data
         # gt_states is [batch, seq_len, max_gt_objects, output_dim]
         # Assuming truth_mask is [batch, seq_len, max_gt_objects] (1 if valid object, 0 if padding)
-        gt_states = batch_data["truth_states"].to(device)
+        gt_prior_states = batch_data["prior_truth_states"].to(device)
+        gt_postieror_states = batch_data["posterior_truth_states"].to(device)
         gt_mask = batch_data["truth_mask"].to(device)
+        truth_ids = batch_data["truth_ids"].to(device)
+        total_association_loss = 0.0
 
-        batch_loss_cls = 0
-        batch_loss_box = 0
+        batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
+        # Initialize persistent assignments for the batch
+        # track_assignments[b, slot_i] = entity truth id (e.g., 1)
+        track_assignments = torch.full((batch_size, max_num_truth_entities), -1).to(
+            device
+        )
 
-        batch_size, num_queries, seq_len, _ = pred_logits.shape
+        for t in range(seq_len):
+            # Get the truth IDs present in this frame's detections
+            # truth_ids: [Batch, Seq, 9] -> current frame: [Batch, 9]
+            frame_truth_ids = truth_ids[:, t]
 
-        for b in range(batch_size):
-            for t in range(seq_len):
+            for b in range(batch_size):
+                for det_idx, truth_id in enumerate(frame_truth_ids[b]):
+                    if truth_id == -1:
+                        continue  # Skip padding
+                    # Check if we already have a slot tracking this Real ID
+                    assigned_slot = (track_assignments[b] == truth_id).nonzero()
 
-                # Get predictions for this specific frame
-                # p_state: [num_queries, obs_dim]
-                # p_score: [num_queries, 1]
-                p_state = pred_states[b, :, t]
-                p_score = pred_logits[b, :, t]
+                    if len(assigned_slot) > 0:
+                        # We found the slot (e.g., Slot 3) that owns this ID.
+                        # Target: Slot 3 should attend to det_idx
+                        pass
+                    else:
+                        # This ID has never been seen before. Assign it a free slot.
+                        # (e.g., Slot 5 was empty, now Slot 5 owns this ID)
+                        free_slots = (track_assignments[b] == -1).nonzero()
+                        if len(free_slots) > 0:
+                            first_free = free_slots[0]
+                            track_assignments[b, first_free] = truth_id
 
-                # Get valid Ground Truths for this frame
-                # Filter out padding using the mask
-                valid_indices = gt_mask[b, t] > 0
-                g_box = gt_states[b, t][valid_indices]  # [num_actual_objs, obs_dim]
+            # Association Loss (L_d):
+            # l_d = -(y * log(AS_i) + (1 - y) * log(1 - AS_i))
+            # y = 1.0 if Slot i matched Det j, 0.0 otherwise.
+            y = torch.zeros((num_track_slots, max_num_detects_per_step), device=device)
 
-                if len(g_box) == 0:
-                    # If no GT objects exist in this frame, all preds should be background (0)
-                    target_cls = torch.zeros_like(p_score)
-                    loss_cls = F.binary_cross_entropy_with_logits(p_score, target_cls)
-                    batch_loss_cls += loss_cls
-                    continue
+            # Mask for slots that are currently active (tracking something)
+            # We only calculate loss for slots that have been assigned an ID.
+            active_track_mask = torch.zeros((num_track_slots), device=device)
 
-                # Association Loss (L_d):
-                # l_d = -(y * log(AS_i) + (1 - y) * log(1 - AS_i))
+            for slot_idx, det_idx in track_assignments:
+                y[slot_idx, det_idx] = 1.0
+                active_track_mask[slot_idx] = 1.0
 
-                # Compute Cost Matrix (on CPU for Scipy)
-                # Cost = Classification Cost + Position Cost
-                # We want to match preds that are confident AND close to the GT
+            # Preds: [Num_Tracks, Max_Dets]
+            preds = pred_assoc_logits[b, :, t, :]
 
-                # L1 Distance Cost
-                cost_dist = torch.cdist(p_state, g_box, p=1).detach().cpu()
+            loss = F.binary_cross_entropy_with_logits(preds, y, reduction="none")
+            total_association_loss += loss.mean()
 
-                # Prob Cost:
-                # Penalize if the model is confident but wrong
-                # specific implementation depends on if p_score is sigmoid or raw logits
-                out_prob = p_score.sigmoid().detach().cpu()
-                cost_class = -out_prob.matmul(torch.ones(len(g_box), 1).T.cpu())
-
-                # Final Cost Matrix
-                C = cost_dist + cost_class
-
-                # 4. Hungarian Matching
-                # row_idx -> indices of predicted tracks
-                # col_idx -> indices of ground truth objects
-                row_idx, col_idx = linear_sum_assignment(C.numpy())
-
-                # Build Classification Targets
-                # Initialize all targets to 0 (Background)
-                target_cls = torch.zeros_like(p_score)
-                # Set matched tracks to 1 (Object)
-                target_cls[row_idx] = 1.0
-
-                # Calculate Losses
-                # We want the matched indices to predict 1, everyone else 0
-                loss_cls = F.binary_cross_entropy_with_logits(p_score, target_cls)
-
-                # State Prediction Loss (L1) - Only for matched pairs
-                matched_p_box = p_state[row_idx]
-                matched_g_box = g_box[col_idx]
-                loss_box = F.l1_loss(matched_p_box, matched_g_box)
-
-                # Accumulate
-                batch_loss_cls += loss_cls
-                batch_loss_box += loss_box
+            # TODO: loss objective for variance, either mahalanobis or KL-Div to minimize distribution differences?
 
         # Average loss over the batch/sequence
         total_steps = batch_size * seq_len
@@ -118,7 +104,17 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Init
-    dataset = TrackingDataset(TRACK_FILE, TRUTH_FILE, OWN_FILE, seq_len=5)
+    num_sensor_modalities = 3
+    max_num_detects_per_step = (
+        num_sensor_modalities**2
+    )  # n^2 sensor modalities each sensor type can detect all n objects,
+    dataset = TrackingDataset(
+        TRACK_FILE,
+        TRUTH_FILE,
+        OWN_FILE,
+        seq_len=5,
+        max_num_detects_per_step=max_num_detects_per_step,
+    )
     loader = DataLoader(dataset, batch_size=5)
 
     model = STTTracker(
@@ -133,5 +129,7 @@ if __name__ == "__main__":
 
     print("Starting Training...")
     for epoch in range(10):
-        loss = train_one_epoch(model, loader, optimizer, device)
+        loss = train_one_epoch(
+            model, loader, optimizer, device, dataset.max_num_truth_entities
+        )
         print(f"Epoch {epoch}: Loss {loss:.4f}")
