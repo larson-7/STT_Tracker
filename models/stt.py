@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+NEAR_NEG_INF = -1e9
 
 # TODO: Incorporate this for variance predictions
 def nll_loss(pred_state, pred_variance, target_state):
@@ -188,7 +189,7 @@ class TrackDetectionInteraction(nn.Module):
         if key_padding_mask is not None:
             # key_padding_mask: [B, N_dets] -> Expand to [B, 1, 1, N_dets]
             mask_expanded = key_padding_mask.view(B, 1, 1, N_dets)
-            attn_logits = attn_logits.masked_fill(mask_expanded, float("-inf"))
+            attn_logits = attn_logits.masked_fill(mask_expanded, NEAR_NEG_INF)
 
         attn_weights = F.softmax(attn_logits, dim=-1)
 
