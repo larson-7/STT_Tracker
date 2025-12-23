@@ -12,6 +12,7 @@ class TrackingDataset(Dataset):
         ownship_file,
         seq_len=5,
         max_num_detects_per_step=3,
+        device="cpu",
     ):
         """
         Args:
@@ -37,7 +38,8 @@ class TrackingDataset(Dataset):
 
         self.episodes = self.tracks_df["episode_id"].unique()
         self.data_indices = []
-
+        self.device = device
+        
         # Create indices
         for ep in self.episodes:
             frames = sorted(
@@ -57,31 +59,31 @@ class TrackingDataset(Dataset):
         obs_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step, self.feature_dim),
             dtype=torch.float32,
-        )
+        ).to(self.device)
         mask_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step), dtype=torch.bool
-        )
+        ).to(self.device)
 
-        # Pad IDs to keep alignment (-1 usually denotes no-object in ID lists)
+        # Pad IDs to keep alignment (-1 denotes no-object in ID lists)
         truth_id_tensor = torch.full(
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
-        )
+        ).to(self.device)
         prior_truth_states_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step, self.feature_dim),
             dtype=torch.float32,
-        )
+        ).to(self.device)
         posterior_truth_states_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step, self.feature_dim),
             dtype=torch.float32,
-        )
+        ).to(self.device)
         # Mask: False (0) = Padding, True (1) = Real Ground Truth Data
         truth_mask_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step), dtype=torch.bool
-        )
+        ).to(self.device)
 
-        sensor_id_tensor = torch.zeros(
-            (self.seq_len, self.max_num_detects_per_step), dtype=torch.long
-        )
+        sensor_id_tensor = torch.full(
+            (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
+        ).to(self.device)
 
         batched_own = []
 

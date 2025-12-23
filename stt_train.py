@@ -4,99 +4,149 @@ from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
 from models.stt import STTTracker
 from stt_data_loader import TrackingDataset
+import torch.nn as nn
 
 
 def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities):
     model.train()
-    total_loss = 0
+    total_epoch_loss = 0
+    
+    # Gaussian NLL Loss to handle state pred + variance simultaneously
+    nll_loss_fn = nn.GaussianNLLLoss(reduction='none')
 
     for batch_idx, batch_data in enumerate(loader):
-        # Forward Pass
-        # outputs["kinematics"]: [batch, num_tracks, seq_len, output_dim]
-        # outputs["association_scores"]: [batch, num_tracks, seq_len, 1]
+        gt_prior_states = batch_data["prior_truth_states"].to(device)       # [B, T, MaxGT, Dim]
+        gt_posterior_states = batch_data["posterior_truth_states"].to(device) # [B, T, MaxGT, Dim]
+        truth_ids = batch_data["truth_ids"].to(device)                      # [B, T, MaxGT]
+        
         outputs = model(batch_data)
-
-        pred_states = outputs["kinematics"]
-        pred_assoc_logits = outputs["association_scores"]
-
-        # Ground Truth Data
-        # gt_states is [batch, seq_len, max_gt_objects, output_dim]
-        # Assuming truth_mask is [batch, seq_len, max_gt_objects] (1 if valid object, 0 if padding)
-        gt_prior_states = batch_data["prior_truth_states"].to(device)
-        gt_postieror_states = batch_data["posterior_truth_states"].to(device)
-        gt_mask = batch_data["truth_mask"].to(device)
-        truth_ids = batch_data["truth_ids"].to(device)
-        total_association_loss = 0.0
+        # Unpack outputs
+        # Shapes: [Batch, Num_Tracks, Seq_Len, Dim]
+        prior_pred_states = outputs["prior_kinematics"]
+        prior_pred_var = outputs["prior_variance"]
+        posterior_pred_states = outputs["posterior_kinematics"]
+        posterior_pred_var = outputs["posterior_variance"]
+        pred_assoc_logits = outputs["association_scores"] # [Batch, Num_Tracks, Seq_Len, Max_Dets]
 
         batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
-        # Initialize persistent assignments for the batch
-        # track_assignments[b, slot_i] = entity truth id (e.g., 1)
-        track_assignments = torch.full((batch_size, max_num_truth_entities), -1).to(
-            device
-        )
+        max_detects = pred_assoc_logits.shape[-1]
+
+        # Initialize persistent assignments for this batch sequence
+        # track_assignments[b, slot_i] = Real Entity ID (e.g., 101)
+        # Initialize with -1 (no assignment)
+        track_assignments = torch.full((batch_size, num_track_slots), -1, dtype=torch.long).to(device)
+
+        batch_loss_assoc = 0.0
+        batch_loss_state = 0.0
+        valid_steps = 0 # Counter for normalization
 
         for t in range(seq_len):
-            # Get the truth IDs present in this frame's detections
-            # truth_ids: [Batch, Seq, 9] -> current frame: [Batch, 9]
-            frame_truth_ids = truth_ids[:, t]
+            # Get the truth IDs present in this specific frame
+            current_frame_truth_ids = truth_ids[:, t] # [Batch, MaxGT]
 
+            # build the target for association and mask for state loss
+            target_assoc_map = torch.zeros_like(pred_assoc_logits[:, :, t, :]) # [B, Slots, Dets]
+            
+            # Masks to ensure we only learn from active slots
+            active_slot_mask = torch.zeros((batch_size, num_track_slots), device=device)
+            
+            # Temporary storage for gathering state targets
+            # We want to align GT states to the Slots
+            aligned_gt_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
+            aligned_gt_posterior = torch.zeros_like(posterior_pred_states[:, :, t, :])
+            
             for b in range(batch_size):
-                for det_idx, truth_id in enumerate(frame_truth_ids[b]):
-                    if truth_id == -1:
-                        continue  # Skip padding
-                    # Check if we already have a slot tracking this Real ID
-                    assigned_slot = (track_assignments[b] == truth_id).nonzero()
-
-                    if len(assigned_slot) > 0:
-                        # We found the slot (e.g., Slot 3) that owns this ID.
-                        # Target: Slot 3 should attend to det_idx
-                        pass
+                # Valid GT indices for this frame (ignore -1 padding in truth_ids)
+                # Assume truth_ids and detections are 1:1 in index for this logic 
+                # (i.e., truth_id[k] corresponds to detection[k])
+                valid_gt_indices = (current_frame_truth_ids[b] != -1).nonzero().squeeze(-1)
+                
+                for gt_idx in valid_gt_indices:
+                    tid = current_frame_truth_ids[b, gt_idx].item()
+                    
+                    # Check if a slot already owns this TID
+                    slot_idx = (track_assignments[b] == tid).nonzero()
+                    
+                    if len(slot_idx) > 0:
+                        slot_idx = slot_idx[0].item()
                     else:
-                        # This ID has never been seen before. Assign it a free slot.
-                        # (e.g., Slot 5 was empty, now Slot 5 owns this ID)
+                        # Assign to new slot if available
                         free_slots = (track_assignments[b] == -1).nonzero()
                         if len(free_slots) > 0:
-                            first_free = free_slots[0]
-                            track_assignments[b, first_free] = truth_id
+                            slot_idx = free_slots[0].item()
+                            track_assignments[b, slot_idx] = tid
+                        else:
+                            # No slots left, skip tracking this object
+                            continue
+                    
+                    if gt_idx < max_detects:
+                        target_assoc_map[b, slot_idx, gt_idx] = 1.0
+                    
+                    # Grab the GT state from the specific index where the ID lives
+                    aligned_gt_prior[b, slot_idx] = gt_prior_states[b, t, gt_idx]
+                    aligned_gt_posterior[b, slot_idx] = gt_posterior_states[b, t, gt_idx]
+                    
+                    # Mark this slot as active for loss calculation
+                    active_slot_mask[b, slot_idx] = 1.0
 
-            # Association Loss (L_d):
-            # l_d = -(y * log(AS_i) + (1 - y) * log(1 - AS_i))
-            # y = 1.0 if Slot i matched Det j, 0.0 otherwise.
-            y = torch.zeros((num_track_slots, max_num_detects_per_step), device=device)
 
-            # Mask for slots that are currently active (tracking something)
-            # We only calculate loss for slots that have been assigned an ID.
-            active_track_mask = torch.zeros((num_track_slots), device=device)
+            # Association Loss (Binary Cross Entropy)
+            # compute over all slots/dets, but targets are 0 unless set above
+            # pred_assoc_logits: [B, Slots, Dets]
+            loss_assoc = F.binary_cross_entropy_with_logits(
+                pred_assoc_logits[:, :, t, :], 
+                target_assoc_map, 
+                reduction='none'
+            )
+            batch_loss_assoc += loss_assoc.mean()
 
-            for slot_idx, det_idx in track_assignments:
-                y[slot_idx, det_idx] = 1.0
-                active_track_mask[slot_idx] = 1.0
+            # State Estimation Loss (Gaussian NLL)
+            # We only calculate state loss for ACTIVE slots
+            if active_slot_mask.sum() > 0:
+                # Prior Loss (t-1)
+                # NLL inputs: (input, target, var)
+                l_prior = nll_loss_fn(
+                    prior_pred_states[:, :, t, :], 
+                    aligned_gt_prior, 
+                    prior_pred_var[:, :, t, :]
+                )
+                # Mask out inactive slots (sum over dim, then mask)
+                l_prior = (l_prior.mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
+                
+                # Posterior Loss (t)
+                l_posterior = nll_loss_fn(
+                    posterior_pred_states[:, :, t, :], 
+                    aligned_gt_posterior, 
+                    posterior_pred_var[:, :, t, :]
+                )
+                l_posterior = (l_posterior.mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
 
-            # Preds: [Num_Tracks, Max_Dets]
-            preds = pred_assoc_logits[b, :, t, :]
+                batch_loss_state += (l_prior + l_posterior)
+                valid_steps += 1
 
-            loss = F.binary_cross_entropy_with_logits(preds, y, reduction="none")
-            total_association_loss += loss.mean()
-
-            # TODO: loss objective for variance, either mahalanobis or KL-Div to minimize distribution differences?
-
-        # Average loss over the batch/sequence
-        total_steps = batch_size * seq_len
-        final_loss = (batch_loss_cls + batch_loss_box * 5.0) / total_steps
+        # Normalize over sequence length
+        if valid_steps > 0:
+            batch_loss_state /= valid_steps
+        
+        batch_loss_assoc /= seq_len
+        
+        # Weights from the paper (Equation 6)
+        # Gamma (assoc), Lambda (post), Alpha (prior)
+        gamma, lam, alpha = 1.0, 5.0, 2.0 
+        
+        final_loss = (gamma * batch_loss_assoc) + (lam * batch_loss_state)
 
         optimizer.zero_grad()
         final_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += final_loss.item()
+        total_epoch_loss += final_loss.item()
 
-    return total_loss / len(loader)
+    return total_epoch_loss / len(loader)
 
 
-# --- Configuration ---
 if __name__ == "__main__":
-    # Create dummy files for testing
-    # In reality, point these to your CSVs
     TRACK_FILE = "data/train_tracks.csv"
     TRUTH_FILE = "data/train_truth.csv"
     OWN_FILE = "data/train_ownship.csv"
@@ -114,6 +164,7 @@ if __name__ == "__main__":
         OWN_FILE,
         seq_len=5,
         max_num_detects_per_step=max_num_detects_per_step,
+        device=device
     )
     loader = DataLoader(dataset, batch_size=5)
 

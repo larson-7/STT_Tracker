@@ -26,7 +26,8 @@ class DetectionEncoder(nn.Module):
         super().__init__()
 
         # Dedicated embedding for the sensor type
-        self.sensor_embedding = nn.Embedding(num_sensor_types, embed_dim)
+        self.unknown_idx = num_sensor_types 
+        self.sensor_embedding = nn.Embedding(num_sensor_types + 1, embed_dim)
         combined_dim = input_dim + embed_dim
 
         self.mlp = nn.Sequential(
@@ -40,9 +41,11 @@ class DetectionEncoder(nn.Module):
     def forward(self, features, sensor_ids):
         # features shape:   [..., input_dim]
         # sensor_ids shape: [..., 1]
+        safe_ids = sensor_ids.clone()
+        safe_ids[safe_ids == -1] = self.unknown_idx
 
         # Create the learnable vector for the sensor type
-        sensor_vecs = self.sensor_embedding(sensor_ids)  # shape: [..., embed_dim]
+        sensor_vecs = self.sensor_embedding(safe_ids)  # shape: [..., embed_dim]
 
         if len(sensor_vecs.shape) > len(features.shape):
             sensor_vecs = sensor_vecs.squeeze(1)
@@ -212,7 +215,7 @@ class TrackStateDecoder(nn.Module):
     """
     Decodes the abstract embedding back into a physical kinematic state.
     Input: The updated track embedding from the TDI.
-    Output: State vector (e.g., x, y, z, vx, vy, ax, ay, track_quality).
+    Output: State vector (e.g., x, y, z, vx, vy, ax, ay).
     """
 
     def __init__(self, hidden_dim=256, state_dim=10):
@@ -224,8 +227,8 @@ class TrackStateDecoder(nn.Module):
             nn.ReLU(),
         )
         # Separate heads for mean and log variance
-        self.state_head = nn.Linear(hidden_dim // 2, state_dim - 1)  # kinematics
-        self.log_var_head = nn.Linear(hidden_dim // 2, state_dim - 1)  # uncertainties
+        self.state_head = nn.Linear(hidden_dim // 2, state_dim)  # kinematics
+        self.log_var_head = nn.Linear(hidden_dim // 2, state_dim)  # uncertainties
 
     def forward(self, updated_track_embedding):
         features = self.decoder_mlp(updated_track_embedding)
@@ -412,8 +415,8 @@ if __name__ == "__main__":
     print("Running Forward Pass...")
     outputs = tracker(batch)
 
-    kinematics = outputs["kinematics"]
-    variance = outputs["variance"]
+    kinematics = outputs["posterior_kinematics"]
+    variance = outputs["posterior_variance"]
     scores = outputs["association_scores"]
 
     print("\n--- Output Shapes ---")
