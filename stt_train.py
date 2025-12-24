@@ -76,17 +76,17 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
     model.train()
     total_epoch_loss = 0
     
-    # Gaussian NLL Loss
     nll_loss_fn = nn.GaussianNLLLoss(reduction='none')
 
-    # Wrap loader with tqdm for progress bar
     pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch_index}")
 
     for batch_idx, batch_data in pbar:
+        # Move data to device
         gt_prior_states = batch_data["prior_truth_states"].to(device)       
         gt_posterior_states = batch_data["posterior_truth_states"].to(device) 
         truth_ids = batch_data["truth_ids"].to(device)                      
         
+        # Forward Pass
         outputs = model(batch_data)
         
         prior_pred_states = outputs["prior_kinematics"]
@@ -98,11 +98,20 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
         batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
         max_detects = pred_assoc_logits.shape[-1]
 
+        # Assignments
         track_assignments = torch.full((batch_size, num_track_slots), -1, dtype=torch.long).to(device)
 
+        # Loss Accumulators
         batch_loss_assoc = 0.0
         batch_loss_prior_state = 0.0
         batch_loss_posterior_state = 0.0
+        
+        # Metric Accumulators
+        metric_assoc_acc = 0.0
+        metric_prior_mae = 0.0
+        metric_post_mae = 0.0
+        metric_avg_var = 0.0
+        
         valid_steps = 0 
 
         for t in range(seq_len):
@@ -113,13 +122,14 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
             aligned_gt_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
             aligned_gt_posterior = torch.zeros_like(posterior_pred_states[:, :, t, :])
             
+            # --- Assignment Logic (Greedy / Heuristic) ---
             for b in range(batch_size):
                 valid_gt_indices = (current_frame_truth_ids[b] != -1).nonzero().squeeze(-1)
                 
                 for gt_idx in valid_gt_indices:
                     tid = current_frame_truth_ids[b, gt_idx].item()
                     
-                    # Logic to find or assign slot
+                    # Find slot or Assign new
                     slot_idx = (track_assignments[b] == tid).nonzero()
                     if len(slot_idx) > 0:
                         slot_idx = slot_idx[0].item()
@@ -138,7 +148,8 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
                     aligned_gt_posterior[b, slot_idx] = gt_posterior_states[b, t, gt_idx]
                     active_slot_mask[b, slot_idx] = 1.0
 
-            # --- Association Loss ---
+            # --- Association Loss & Accuracy ---
+            # Loss
             loss_assoc = F.binary_cross_entropy_with_logits(
                 pred_assoc_logits[:, :, t, :], 
                 target_assoc_map, 
@@ -146,24 +157,51 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
             )
             batch_loss_assoc += loss_assoc.mean()
 
-            # --- State Loss ---
+            # Accuracy (Threshold logits at 0.0 -> Prob 0.5)
+            # We calculate accuracy over all slots/dets
+            preds_binary = (pred_assoc_logits[:, :, t, :] > 0.0).float()
+            correct_pixels = (preds_binary == target_assoc_map).float()
+            metric_assoc_acc += correct_pixels.mean()
+
+            # --- State Loss & Error (MAE) ---
             if active_slot_mask.sum() > 0:
+                # Prior
                 l_prior = nll_loss_fn(prior_pred_states[:, :, t, :], aligned_gt_prior, prior_pred_var[:, :, t, :])
                 l_prior = (l_prior.mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
                 
+                # Posterior
                 l_posterior = nll_loss_fn(posterior_pred_states[:, :, t, :], aligned_gt_posterior, posterior_pred_var[:, :, t, :])
                 l_posterior = (l_posterior.mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
 
                 batch_loss_prior_state += l_prior
                 batch_loss_posterior_state += l_posterior
+                
+                # --- Metrics: Mean Absolute Error  ---
+                mae_prior = F.l1_loss(prior_pred_states[:, :, t, :], aligned_gt_prior, reduction='none').mean(dim=-1)
+                mae_post = F.l1_loss(posterior_pred_states[:, :, t, :], aligned_gt_posterior, reduction='none').mean(dim=-1)
+                
+                # Mask out inactive slots so empty slots don't skew the error to 0
+                metric_prior_mae += (mae_prior * active_slot_mask).sum() / active_slot_mask.sum()
+                metric_post_mae += (mae_post * active_slot_mask).sum() / active_slot_mask.sum()
+                
+                # --- Metrics: Average Variance (Uncertainty) ---
+                # Helpful to see if model is "confident" (low var) or "lost" (high var)
+                metric_avg_var += (posterior_pred_var[:, :, t, :].mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
+                
                 valid_steps += 1
 
+        # Normalize metrics by sequence length
         if valid_steps > 0:
             batch_loss_prior_state /= valid_steps
             batch_loss_posterior_state /= valid_steps
+            metric_prior_mae /= valid_steps
+            metric_post_mae /= valid_steps
+            metric_avg_var /= valid_steps
         
         batch_loss_assoc /= seq_len
+        metric_assoc_acc /= seq_len
         
+        # Weighted Sum
         gamma, lam, alpha = 1.0, 5.0, 2.0 
         final_loss = (gamma * batch_loss_assoc) + (lam * batch_loss_prior_state) + (alpha * batch_loss_posterior_state)
 
@@ -174,18 +212,28 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
 
         total_epoch_loss += final_loss.item()
         
-        # --- Update Tensorboard & Tqdm ---
-        # Calculate global step for continuous plotting across epochs
+        # --- Tensorboard Logging ---
         global_step = epoch_index * len(loader) + batch_idx
         
+        # Losses
         writer.add_scalar("Loss/Total", final_loss.item(), global_step)
         writer.add_scalar("Loss/Association", batch_loss_assoc.item(), global_step)
-        writer.add_scalar("Loss/State", batch_loss_prior_state.item() if isinstance(batch_loss_prior_state, torch.Tensor) else 0, global_step)
+        writer.add_scalar("Loss/Prior", batch_loss_prior_state.item() if isinstance(batch_loss_prior_state, torch.Tensor) else 0, global_step)
+        writer.add_scalar("Loss/Posterior", batch_loss_posterior_state.item() if isinstance(batch_loss_posterior_state, torch.Tensor) else 0, global_step)
 
-        # Update tqdm bar text
+        # Accuracy / Error
+        writer.add_scalar("Accuracy/Association_Acc", metric_assoc_acc.item(), global_step)
+        writer.add_scalar("Error/Prior_MAE", metric_prior_mae.item() if isinstance(metric_prior_mae, torch.Tensor) else 0, global_step)
+        writer.add_scalar("Error/Posterior_MAE", metric_post_mae.item() if isinstance(metric_post_mae, torch.Tensor) else 0, global_step)
+        
+        # Debugging (Variance)
+        writer.add_scalar("Debug/Avg_Predicted_Variance", metric_avg_var.item() if isinstance(metric_avg_var, torch.Tensor) else 0, global_step)
+
+        # Update tqdm
         pbar.set_postfix({
-            "Loss": f"{final_loss.item():.4f}", 
-            "Assoc": f"{batch_loss_assoc.item():.4f}"
+            "Loss": f"{final_loss.item():.2f}", 
+            "PostMAE": f"{metric_prior_mae.item() if isinstance(metric_prior_mae, torch.Tensor) else 0:.2f}",
+            "AssocAcc": f"{metric_assoc_acc.item():.2f}"
         })
 
         # --- XY Plotting (First batch only) ---
@@ -193,7 +241,6 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
             log_xy_plot(writer, epoch_index, gt_posterior_states, posterior_pred_states)
 
     return total_epoch_loss / len(loader)
-
 
 if __name__ == "__main__":
     TRACK_FILE = "data/train_tracks.csv"
@@ -215,7 +262,7 @@ if __name__ == "__main__":
         max_num_detects_per_step=max_num_detects_per_step,
         device=device
     )
-    loader = DataLoader(dataset, batch_size=5, shuffle=True) # Added shuffle=True
+    loader = DataLoader(dataset, batch_size=5, shuffle=True) 
 
     model = STTTracker(
         num_tracks=10,
