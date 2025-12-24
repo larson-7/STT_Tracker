@@ -23,9 +23,9 @@ from stonesoup.initiator.simple import MultiMeasurementInitiator
 
 # --- Configuration ---
 OUTPUT_DIR = "data"
-TRAIN_SAMPLES = 100
-VAL_SAMPLES = 20
-DURATION_FRAMES = 60
+TRAIN_SAMPLES = 1000
+VAL_SAMPLES = 200
+DURATION_FRAMES = 600
 
 # Map sensor names to integer IDs
 SENSOR_MAP = {
@@ -119,8 +119,8 @@ def generate_random_scenario(
             ConstantAcceleration(0.01),
         ]
     )
-
-    num_targets = np.random.randint(1, max_num_objects)
+    
+    num_targets = np.random.randint(1, max_num_objects) if max_num_objects > 1 else 1
     ground_truths = []
 
     for i in range(num_targets):
@@ -237,8 +237,8 @@ def run_episode(
 
     sensor_configs = {
         "Modality_A": {"cov": 0.5, "prob": 0.95, "clutter": 1},
-        "Modality_B": {"cov": 5.0, "prob": 0.90, "clutter": 2},
-        "Modality_C": {"cov": 10.0, "prob": 0.85, "clutter": 5},
+        # "Modality_B": {"cov": 5.0, "prob": 0.90, "clutter": 2},
+        # "Modality_C": {"cov": 10.0, "prob": 0.85, "clutter": 5},
     }
 
     trackers = {}
@@ -408,7 +408,7 @@ def run_episode(
 def main():
     ensure_dir(OUTPUT_DIR)
     start_time = datetime.now().replace(microsecond=0)
-    max_num_objects = 3
+    max_num_objects = 1
 
     # --- FORMAT SPECIFICATIONS ---
     # These lists enforce the output types for CSV saving.

@@ -77,6 +77,7 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
     total_epoch_loss = 0
     
     nll_loss_fn = nn.GaussianNLLLoss(reduction='none')
+    l1_loss_fn = nn.L1Loss()
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch_index}")
 
@@ -166,11 +167,13 @@ def train_one_epoch(model, loader, optimizer, device, max_num_truth_entities, wr
             # --- State Loss & Error (MAE) ---
             if active_slot_mask.sum() > 0:
                 # Prior
-                l_prior = nll_loss_fn(prior_pred_states[:, :, t, :], aligned_gt_prior, prior_pred_var[:, :, t, :])
+                # l_prior = nll_loss_fn(prior_pred_states[:, :, t, :], aligned_gt_prior, prior_pred_var[:, :, t, :])
+                l_prior = l1_loss_fn(prior_pred_states[:, :, t, :], aligned_gt_prior)
                 l_prior = (l_prior.mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
                 
                 # Posterior
-                l_posterior = nll_loss_fn(posterior_pred_states[:, :, t, :], aligned_gt_posterior, posterior_pred_var[:, :, t, :])
+                # l_posterior = nll_loss_fn(posterior_pred_states[:, :, t, :], aligned_gt_posterior, posterior_pred_var[:, :, t, :])
+                l_posterior = l1_loss_fn(posterior_pred_states[:, :, t, :], aligned_gt_posterior)
                 l_posterior = (l_posterior.mean(dim=-1) * active_slot_mask).sum() / active_slot_mask.sum()
 
                 batch_loss_prior_state += l_prior
@@ -253,22 +256,22 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    num_sensor_modalities = 3
+    num_sensor_modalities = 1
     max_num_detects_per_step = num_sensor_modalities**2
     
     dataset = TrackingDataset(
         TRACK_FILE, TRUTH_FILE, OWN_FILE,
-        seq_len=5,
+        seq_len=60,
         max_num_detects_per_step=max_num_detects_per_step,
         device=device
     )
-    loader = DataLoader(dataset, batch_size=5, shuffle=True) 
+    loader = DataLoader(dataset, batch_size=1, shuffle=True) 
 
     model = STTTracker(
-        num_tracks=10,
+        num_tracks=1,
         input_dim=9,
         sensor_type_embedding_dim=8,
-        num_sensor_modalities=3,
+        num_sensor_modalities=num_sensor_modalities,
         embedding_dim=256,
         max_history_len=100,
     ).to(device)
@@ -278,7 +281,7 @@ if __name__ == "__main__":
     print(f"Starting Training on {device}...")
     
     try:
-        for epoch in range(10):
+        for epoch in range(100):
             loss = train_one_epoch(
                 model, loader, optimizer, device, dataset.max_num_truth_entities, writer, epoch
             )
