@@ -25,7 +25,7 @@ from stonesoup.initiator.simple import MultiMeasurementInitiator
 OUTPUT_DIR = "data"
 TRAIN_SAMPLES = 1000
 VAL_SAMPLES = 200
-DURATION_FRAMES = 600
+DURATION_FRAMES = 60
 
 # Map sensor names to integer IDs
 SENSOR_MAP = {
@@ -119,7 +119,7 @@ def generate_random_scenario(
             ConstantAcceleration(0.01),
         ]
     )
-    
+
     num_targets = np.random.randint(1, max_num_objects) if max_num_objects > 1 else 1
     ground_truths = []
 
