@@ -237,8 +237,8 @@ def run_episode(
 
     sensor_configs = {
         "Modality_A": {"cov": 0.5, "prob": 0.95, "clutter": 1},
-        # "Modality_B": {"cov": 5.0, "prob": 0.90, "clutter": 2},
-        # "Modality_C": {"cov": 10.0, "prob": 0.85, "clutter": 5},
+        "Modality_B": {"cov": 5.0, "prob": 0.90, "clutter": 2},
+        "Modality_C": {"cov": 10.0, "prob": 0.85, "clutter": 5},
     }
 
     trackers = {}
@@ -312,7 +312,9 @@ def run_episode(
             model = models[name]
             base_prob = config["prob"]
 
+            # --- Single Pass for Detections & Target-Dependent Clutter ---
             for gt_path, state in active_truths:
+                # Calculate Detection Probability (Pd) based on geometry
                 if isinstance(ownship_state, State):
                     det_prob = get_detection_probability(
                         ownship_state, state, base_prob
@@ -320,6 +322,9 @@ def run_episode(
                 else:
                     det_prob = 0.9
 
+                true_detection = False
+                # Attempt True Detection
+                # Roll against Pd to see if the sensor 'sees' the object
                 if np.random.rand() <= det_prob:
                     meas = model.function(state, noise=True)
                     detections.add(
@@ -330,15 +335,32 @@ def run_episode(
                             groundtruth_path=gt_path,
                         )
                     )
+                    true_detection = True
 
-            for _ in range(np.random.poisson(config["clutter"])):
-                detections.add(
-                    Clutter(
-                        np.random.uniform(-100, 100, (3, 1)),
-                        timestamp=current_time,
-                        measurement_model=model,
-                    )
-                )
+                # Attempt Target-Generated Clutter (Glint/Multipath)
+                # We perform a SECOND roll against det_prob.
+                # This ensures that if we are turned away (det_prob=0), we generate NO clutter.
+                # If we are at the edge of the envelope (det_prob=0.4), clutter is less likely.
+                if not true_detection and np.random.rand() <= det_prob:
+                    # Determine number of clutter points for this specific target
+                    n_clutter = np.random.poisson(config["clutter"])
+
+                    # Get the true position in measurement space (clean center)
+                    true_pos_meas = model.function(state, noise=False)
+
+                    for _ in range(n_clutter):
+                        # Generate offsets centered on the target
+                        # Standard deviation of 10.0 simulates the 'cloud' around the object
+                        offset = np.random.normal(0, 10.0, (3, 1))
+                        clutter_pos = true_pos_meas + offset
+
+                        detections.add(
+                            Clutter(
+                                clutter_pos,
+                                timestamp=current_time,
+                                measurement_model=model,
+                            )
+                        )
 
             tracker = trackers[name]
             tracks = tracker["tracks"]
@@ -362,7 +384,7 @@ def run_episode(
             tracks.update(new_tracks)
             tracker["tracks"] = tracks
 
-            # Extract Track Data
+            # Extract Track Data (Standard)
             sid = SENSOR_MAP[name]
             for trk in tracks:
                 vec = trk.state_vector.flatten()

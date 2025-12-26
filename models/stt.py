@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 NEAR_NEG_INF = -1e9
 
+
 # TODO: Incorporate this for variance predictions
 def nll_loss(pred_state, pred_variance, target_state):
     """
@@ -27,7 +28,7 @@ class DetectionEncoder(nn.Module):
         super().__init__()
 
         # Dedicated embedding for the sensor type
-        self.unknown_idx = num_sensor_types 
+        self.unknown_idx = num_sensor_types
         self.sensor_embedding = nn.Embedding(num_sensor_types + 1, embed_dim)
         combined_dim = input_dim + embed_dim
 
@@ -273,6 +274,63 @@ class STTTracker(nn.Module):
         # Learn distinct embeddings for each of the N track slots
         # Shape: [1, Num_Tracks, Embed_Dim]
         self.track_query_embed = nn.Parameter(torch.randn(1, num_tracks, embedding_dim))
+
+    def load_weights(self, path: str, device: torch.device = None, strict: bool = True):
+        """
+        Loads weights from a .pth file.
+
+        Args:
+            path: Path to the .pth file.
+            device: Device to load the tensors onto (default: current model device).
+            strict: Whether to strictly enforce that the keys in state_dict
+                    match the keys returned by this module's state_dict().
+        """
+        import os
+
+        if device is None:
+            # Detect the device of the current model parameters
+            device = next(self.parameters()).device
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Weight file not found at: {path}")
+
+        print(f"Loading weights from {path} to {device}...")
+
+        # map_location ensures we don't crash trying to load CUDA weights on CPU
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+
+        # Unwrap if it's a full training checkpoint (e.g., {'model': ..., 'optimizer': ...})
+        if isinstance(checkpoint, dict):
+            if "model_state_dict" in checkpoint:
+                print(
+                    "  > Detected full checkpoint dictionary. Extracting 'model_state_dict'..."
+                )
+                state_dict = checkpoint["model_state_dict"]
+            elif "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            else:
+                # Assume the dict itself is the state dict
+                state_dict = checkpoint
+        else:
+            state_dict = checkpoint
+
+        # Load the state dict
+        try:
+            missing, unexpected = self.load_state_dict(state_dict, strict=strict)
+
+            if len(missing) > 0:
+                print(f"  [WARNING] Missing keys: {missing}")
+            if len(unexpected) > 0:
+                print(f"  [WARNING] Unexpected keys: {unexpected}")
+
+            if len(missing) == 0 and len(unexpected) == 0:
+                print("  > Success: All keys matched perfectly.")
+
+        except RuntimeError as e:
+            print(f"  [ERROR] Failed to load weights: {e}")
+            raise e
+
+        self.to(device)
 
     def forward(self, batch):
         features = batch["obs_features"]  # [B, Seq, Max_Dets, Dim]
