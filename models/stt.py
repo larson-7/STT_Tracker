@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -64,8 +65,22 @@ class TemporalEncoder(nn.Module):
     Output: Single vector 'track_query'.
     """
 
-    def __init__(self, hidden_dim=256, nhead=4, num_layers=2):
+    def __init__(self, hidden_dim=256, nhead=4, num_layers=2, max_len=5000):
         super().__init__()
+
+        # Setup Standard Sinusoidal Positional Encoding
+        # We register this as a buffer so it saves with state_dict but isn't a learned parameter
+        pe = torch.zeros(max_len, hidden_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, hidden_dim, 2).float() * (-math.log(10000.0) / hidden_dim)
+        )
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        # Shape: [1, Max_Len, Hidden_Dim] for broadcasting
+        self.register_buffer("pe", pe.unsqueeze(0))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=nhead, batch_first=True
@@ -73,13 +88,17 @@ class TemporalEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
-        # TODO: positional offset here
 
     def forward(self, track_history):
         """
-        track_history: [batch_size, history_length, hidden_dim]
+        track_history: [Batch, History_Length, Hidden_Dim]
         """
         seq_len = track_history.size(1)
+
+        # Add Positional Encoding to the input
+        # We slice the pre-computed PE to match the current sequence length
+        # track_history + pe[:seq_len]
+        x = track_history + self.pe[:, :seq_len, :]
 
         # Create Causal Mask
         mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(
@@ -87,9 +106,7 @@ class TemporalEncoder(nn.Module):
         )
 
         # Apply the mask during the forward pass
-        temporal_features = self.transformer_encoder(
-            track_history, mask=mask, is_causal=True
-        )
+        temporal_features = self.transformer_encoder(x, mask=mask, is_causal=True)
 
         # Take the last valid token as the query for current timestep
         track_query = temporal_features[:, -1, :]
