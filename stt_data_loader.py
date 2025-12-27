@@ -13,44 +13,60 @@ class TrackingDataset(Dataset):
         seq_len=5,
         max_num_detects_per_step=3,
         device="cpu",
+        # Allow passing pre-computed stats so Train and Val use SAME scaling
+        stats: dict = None,
     ):
-        """
-        Args:
-            max_num_detects_per_step: Fixed size to pad observations to (required for learnable tokens).
-        """
         self.seq_len = seq_len
         self.max_num_detects_per_step = max_num_detects_per_step
-        self.feature_dim = 9  # x, y, z, vx, vy, vz, ax, ay, az
+        self.feature_dim = 9
+        self.device = device
+        self.max_num_truth_objs = 0
 
         # Load Data
         self.tracks_df = pd.read_csv(track_file)
         self.truth_df = pd.read_csv(truth_file)
-        self.max_num_truth_entities = len(self.truth_df["object_id"].unique())
         self.own_df = pd.read_csv(ownship_file)
 
-        # Normalize
-        scale_factor = 100.0
         cols_to_scale = ["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"]
+
+        if stats is None:
+            # Calculate Mean and Std from Truth (most reliable source)
+            # You could also concatenate tracks_df + truth_df to get global stats
+            print("Computing normalization statistics from training data...")
+            self.stats = {}
+            for c in cols_to_scale:
+                mean = self.truth_df[c].mean()
+                std = self.truth_df[c].std()
+                # Avoid division by zero for constant columns (like Z often is)
+                if std < 1e-6:
+                    std = 1.0
+                self.stats[c] = {"mean": mean, "std": std}
+        else:
+            self.stats = stats
+
+        # Apply Standardization: (Value - Mean) / Std
         for df in [self.tracks_df, self.truth_df, self.own_df]:
             for c in cols_to_scale:
                 if c in df.columns:
-                    df[c] /= scale_factor
+                    mu = self.stats[c]["mean"]
+                    sigma = self.stats[c]["std"]
+                    df[c] = (df[c] - mu) / sigma
 
         self.episodes = self.tracks_df["episode_id"].unique()
         self.data_indices = []
-        self.device = device
-
-        # Create indices
         for ep in self.episodes:
             frames = sorted(
                 self.tracks_df[self.tracks_df["episode_id"] == ep]["frame_idx"].unique()
             )
             if len(frames) >= seq_len:
-                # sliding window for long episodes
                 for i in range(len(frames) - seq_len + 1):
                     self.data_indices.append((ep, frames[i : i + seq_len]))
             else:
                 self.data_indices.append((ep, frames))
+
+    def get_stats(self):
+        """Return stats to be passed to Validation set"""
+        return self.stats
 
     def __len__(self):
         return len(self.data_indices)
@@ -122,6 +138,7 @@ class TrackingDataset(Dataset):
                 & (self.truth_df["frame_idx"] == f_idx)
             ]
             num_truth_objs = min(len(truth_states), self.max_num_detects_per_step)
+            self.max_num_truth_objs = max(self.max_num_truth_objs, num_truth_objs)
 
             if num_truth_objs > 0:
                 truth_feats = truth_states[

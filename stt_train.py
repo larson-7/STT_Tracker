@@ -16,81 +16,142 @@ from models.stt import STTTracker
 from stt_data_loader import TrackingDataset
 
 
+def get_curriculum_weights(epoch, device):
+    """
+    Returns a weight tensor [9] for (x,y,z, vx,vy,vz, ax,ay,az).
+
+    Curriculum Strategy:
+    - Epoch 0-50:   Focus ONLY on Position (Vel/Acc weights are negligible).
+    - Epoch 50-100: Ramp up Velocity from 0.0 to 1.0.
+    - Epoch 100+:   Ramp up Acceleration from 0.0 to 0.5.
+    """
+    # Base weights
+    pos_w = 1.0
+
+    vel_start = 50
+    vel_ramp_end = 100
+
+    if epoch < vel_start:
+        # Use a tiny epsilon (1e-4) instead of 0.0 to keep the gradient heads alive
+        # without affecting the loss significantly.
+        vel_w = 1e-4
+    else:
+        # Ramp from 0.0 to 1.0
+        progress = (epoch - vel_start) / (vel_ramp_end - vel_start)
+        vel_w = np.clip(progress, 0.0, 1.0)
+
+    acc_start = 100
+    acc_ramp_end = 150
+
+    if epoch < acc_start:
+        acc_w = 0.0
+    else:
+        # Ramp from 0.0 to 0.5
+        progress = (epoch - acc_start) / (acc_ramp_end - acc_start)
+        acc_w = np.clip(progress * 0.5, 0.0, 0.5)
+
+    weights = torch.tensor(
+        [
+            pos_w,
+            pos_w,
+            pos_w,  # X, Y, Z
+            vel_w,
+            vel_w,
+            vel_w,  # Vx, Vy, Vz
+            acc_w,
+            acc_w,
+            acc_w,  # Ax, Ay, Az
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    return weights
+
+
 def log_xy_plot(
-    writer, epoch, batch_data, pred_states, batch_idx=0, tag="Tracking/XY_Plot"
+    writer,
+    epoch,
+    batch_data,
+    pred_states,
+    dataset_stats,
+    batch_idx=0,
+    tag="Tracking/XY_Plot",
 ):
     """
-    Logs an XY plot of truth, predictions, and detections for a single batch item.
-    Adds sequential numbering to the prediction points to show their temporal order.
+    Logs an XY plot of truth, predictions, and detections.
+    Un-normalizes data using dataset_stats before plotting so axes are in Meters.
     """
     b = batch_idx
     valid_seq_mask = batch_data["valid_seq_mask"][b].detach().cpu().numpy()
 
-    # Filter data based on valid sequence length
-    gt = batch_data["posterior_truth_states"][b].detach().cpu().numpy()[valid_seq_mask]
-    detections = batch_data["obs_features"][b].detach().cpu().numpy()[valid_seq_mask]
+    # Get Normalization Stats
+    mu_x, std_x = dataset_stats["x"]["mean"], dataset_stats["x"]["std"]
+    mu_y, std_y = dataset_stats["y"]["mean"], dataset_stats["y"]["std"]
+
+    def unnorm(arr_x, arr_y):
+        return (arr_x * std_x + mu_x), (arr_y * std_y + mu_y)
+
+    # Ground Truth
+    gt_raw = (
+        batch_data["posterior_truth_states"][b].detach().cpu().numpy()[valid_seq_mask]
+    )
+    gt_x, gt_y = unnorm(gt_raw[:, :, 0], gt_raw[:, :, 1])
+
+    # Detections
+    det_raw = batch_data["obs_features"][b].detach().cpu().numpy()[valid_seq_mask]
+    det_x, det_y = unnorm(det_raw[:, :, 0], det_raw[:, :, 1])
+
     obs_ids = batch_data["obs_ids"][b].detach().cpu().numpy()[valid_seq_mask]
     obs_mask = batch_data["obs_mask"][b].detach().cpu().numpy()[valid_seq_mask]
     truth_ids = batch_data["truth_ids"][b].detach().cpu().numpy()[valid_seq_mask]
 
-    # Slice predictions to match the valid sequence length
-    pred = pred_states[b].detach().cpu().numpy()[:, valid_seq_mask, :]
+    # Predictions
+    pred_raw = pred_states[b].detach().cpu().numpy()[:, valid_seq_mask, :]
+    pred_x, pred_y = unnorm(pred_raw[:, :, 0], pred_raw[:, :, 1])
 
     fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_title(f"Epoch {epoch} - {tag}")
+    ax.set_title(f"Epoch {epoch} - {tag} (Units: Meters)")
     ax.grid(True, alpha=0.3)
-
     cmap = matplotlib.colormaps["tab10"]
 
-    # --- Plot Ground Truth ---
-    _, max_gt, _ = gt.shape
+    # Plot Ground Truth
+    _, max_gt, _ = gt_raw.shape
     for gt_idx in range(max_gt):
-        path_x, path_y = gt[:, gt_idx, 0], gt[:, gt_idx, 1]
-        # Skip if the entire path is (0,0), indicating a non-existent track
-        if (path_x == 0).all() and (path_y == 0).all():
+        px, py = gt_x[:, gt_idx], gt_y[:, gt_idx]
+        if (gt_raw[:, gt_idx, 0] == 0).all() and (gt_raw[:, gt_idx, 1] == 0).all():
             continue
-
         ax.plot(
-            path_x,
-            path_y,
+            px,
+            py,
             color=cmap(0),
             marker="o",
             markersize=3,
             alpha=0.4,
-            label="Truth" if gt_idx == 0 else "",  # Label only the first truth track
+            label="Truth" if gt_idx == 0 else "",
         )
 
-    # --- Plot Predictions with Sequential Numbering ---
-    num_slots, seq_len, _ = pred.shape
-    prediction_color = cmap(1)  # Color for predictions
-
+    # Plot Predictions
+    num_slots, seq_len, _ = pred_raw.shape
+    prediction_color = cmap(1)
     for slot_idx in range(num_slots):
-        path_x, path_y = pred[slot_idx, :, 0], pred[slot_idx, :, 1]
-
-        # Skip if the entire path is effectively zero, indicating an unused slot
-        if (abs(path_x) < 1e-3).all() and (abs(path_y) < 1e-3).all():
+        px, py = pred_x[slot_idx, :], pred_y[slot_idx, :]
+        if (np.abs(pred_raw[slot_idx, :, 0]) < 1e-2).all():
             continue
 
-        # Plot the prediction markers
         ax.plot(
-            path_x,
-            path_y,
+            px,
+            py,
             color=prediction_color,
             marker=">",
             markersize=4,
             alpha=0.8,
             linestyle="None",
-            label=(
-                "Prediction" if slot_idx == 0 else ""
-            ),  # Label only the first prediction track
+            label="Prediction" if slot_idx == 0 else "",
         )
-
-        # Add sequential numbers to each prediction point
         for t in range(seq_len):
-            x, y = path_x[t], path_y[t]
             ax.text(
-                x,
-                y,
+                px[t],
+                py[t],
                 str(t),
                 fontsize=8,
                 color="black",
@@ -99,29 +160,22 @@ def log_xy_plot(
                 alpha=0.8,
             )
 
-    # --- Plot Detections (Conditional Markers) ---
-    seq_len, max_det, _ = detections.shape
+    # Plot Detections
+    seq_len, max_det, _ = det_raw.shape
     plotted_labels = set()
-
     for t in range(seq_len):
         for d in range(max_det):
             if not obs_mask[t, d]:
                 continue
-
-            x, y = detections[t, d, 0], detections[t, d, 1]
+            x, y = det_x[t, d], det_y[t, d]
             oid = int(obs_ids[t, d])
             truth_id = int(truth_ids[t, d])
-
-            # Determine marker type and label based on whether it's truth-associated or clutter
             marker_type = "*" if truth_id >= 0 else "x"
             label_suffix = "det" if truth_id >= 0 else "clutter"
 
-            # Only plot if the detection is not at (0,0)
-            if x != 0 or y != 0:
-                # Assign a unique color to each observation ID
+            if det_raw[t, d, 0] != 0 or det_raw[t, d, 1] != 0:
                 color = cmap(oid % 10 + 2)
                 label = f"Obs{oid}:{label_suffix}"
-
                 ax.plot(
                     x,
                     y,
@@ -131,18 +185,13 @@ def log_xy_plot(
                     markersize=7 if marker_type == "*" else 5,
                     alpha=0.7,
                     linestyle="None",
-                    # Add label only if it hasn't been added before to avoid duplicate legend entries
                     label=label if label not in plotted_labels else "",
                 )
                 plotted_labels.add(label)
 
-    # --- Clean up Legend ---
-    # Get handles and labels, remove duplicates, and sort them
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     sorted_keys = sorted(by_label.keys())
-
-    # Create the legend outside the plot area
     ax.legend(
         [by_label[k] for k in sorted_keys],
         sorted_keys,
@@ -150,17 +199,29 @@ def log_xy_plot(
         bbox_to_anchor=(1.15, 1),
     )
 
-    # Log the figure to TensorBoard
     writer.add_figure(tag, fig, global_step=epoch)
-    plt.close(fig)  # Close the figure to free memory
+    plt.close(fig)
 
 
 def train_one_epoch(
-    model, loader, optimizer, device, max_num_truth_entities, writer, epoch_index
+    model,
+    loader,
+    optimizer,
+    device,
+    max_num_truth_entities,
+    writer,
+    epoch_index,
+    dataset_stats,
 ):
     model.train()
     total_epoch_loss = 0
     l1_loss_fn = nn.L1Loss(reduction="none")
+    loss_weights = get_curriculum_weights(epoch_index, device)
+
+    if epoch_index % 5 == 0:
+        writer.add_scalar("Weights/Position", loss_weights[0], epoch_index)
+        writer.add_scalar("Weights/Velocity", loss_weights[3], epoch_index)
+        writer.add_scalar("Weights/Accel", loss_weights[6], epoch_index)
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Train Ep {epoch_index}")
 
@@ -178,16 +239,13 @@ def train_one_epoch(
 
         batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
         max_detects = pred_assoc_logits.shape[-1]
-
         track_assignments = torch.full(
             (batch_size, num_track_slots), -1, dtype=torch.long
         ).to(device)
 
-        # Accumulators
         batch_loss_assoc_sum = 0.0
         batch_loss_prior_sum = 0.0
         batch_loss_posterior_sum = 0.0
-
         batch_metric_post_mae_sum = 0.0
         batch_metric_prior_mae_sum = 0.0
         batch_metric_assoc_acc_sum = 0.0
@@ -198,7 +256,6 @@ def train_one_epoch(
         for t in range(seq_len):
             current_frame_truth_ids = truth_ids[:, t]
             is_step_valid = valid_mask[:, t] > 0
-
             target_assoc_map = torch.zeros_like(pred_assoc_logits[:, :, t, :])
             active_slot_mask = torch.zeros((batch_size, num_track_slots), device=device)
             aligned_gt_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
@@ -207,14 +264,12 @@ def train_one_epoch(
             for b in range(batch_size):
                 if not is_step_valid[b]:
                     continue
-
                 valid_gt_indices = (
                     (current_frame_truth_ids[b] != -1).nonzero().squeeze(-1)
                 )
                 for gt_idx in valid_gt_indices:
                     tid = current_frame_truth_ids[b, gt_idx].item()
                     slot_idx = (track_assignments[b] == tid).nonzero()
-
                     if len(slot_idx) > 0:
                         slot_idx = slot_idx[0].item()
                     else:
@@ -224,10 +279,8 @@ def train_one_epoch(
                             track_assignments[b, slot_idx] = tid
                         else:
                             continue
-
                     if gt_idx < max_detects:
                         target_assoc_map[b, slot_idx, gt_idx] = 1.0
-
                     aligned_gt_prior[b, slot_idx] = gt_prior_states[b, t, gt_idx]
                     aligned_gt_posterior[b, slot_idx] = gt_posterior_states[
                         b, t, gt_idx
@@ -236,52 +289,45 @@ def train_one_epoch(
 
             active_slot_mask = active_slot_mask * is_step_valid.unsqueeze(-1).float()
 
-            # --- Association Metrics ---
             loss_assoc = F.binary_cross_entropy_with_logits(
                 pred_assoc_logits[:, :, t, :], target_assoc_map, reduction="none"
             )
-            loss_assoc_per_batch = loss_assoc.mean(dim=(1, 2)) * is_step_valid.float()
-            batch_loss_assoc_sum += loss_assoc_per_batch.sum()
+            batch_loss_assoc_sum += (
+                loss_assoc.mean(dim=(1, 2)) * is_step_valid.float()
+            ).sum()
 
-            # Accuracy: (Logits > 0) == Target
             pred_assoc_binary = (pred_assoc_logits[:, :, t, :] > 0.0).float()
             acc_assoc = (pred_assoc_binary == target_assoc_map).float().mean(dim=(1, 2))
             batch_metric_assoc_acc_sum += (acc_assoc * is_step_valid.float()).sum()
 
             total_valid_assoc_steps += is_step_valid.sum()
 
-            # --- Regression Metrics ---
             num_active = active_slot_mask.sum()
             if num_active > 0:
-                # Prior Loss
-                l_prior = l1_loss_fn(
-                    prior_pred_states[:, :, t, :], aligned_gt_prior
-                ).mean(dim=-1)
-                batch_loss_prior_sum += (l_prior * active_slot_mask).sum()
-
-                # Prior MAE
-                mae_prior = F.l1_loss(
-                    prior_pred_states[:, :, t, :], aligned_gt_prior, reduction="none"
-                ).mean(dim=-1)
-                batch_metric_prior_mae_sum += (mae_prior * active_slot_mask).sum()
-
-                # Posterior Loss
-                l_posterior = l1_loss_fn(
+                raw_prior = l1_loss_fn(prior_pred_states[:, :, t, :], aligned_gt_prior)
+                raw_post = l1_loss_fn(
                     posterior_pred_states[:, :, t, :], aligned_gt_posterior
-                ).mean(dim=-1)
-                batch_loss_posterior_sum += (l_posterior * active_slot_mask).sum()
+                )
 
-                # Posterior MAE
-                mae_post = F.l1_loss(
-                    posterior_pred_states[:, :, t, :],
-                    aligned_gt_posterior,
-                    reduction="none",
-                ).mean(dim=-1)
-                batch_metric_post_mae_sum += (mae_post * active_slot_mask).sum()
+                weighted_prior = raw_prior * loss_weights.view(1, 1, -1)
+                weighted_post = raw_post * loss_weights.view(1, 1, -1)
+
+                batch_loss_prior_sum += (
+                    weighted_prior.sum(dim=-1) * active_slot_mask
+                ).sum()
+                batch_loss_posterior_sum += (
+                    weighted_post.sum(dim=-1) * active_slot_mask
+                ).sum()
+
+                batch_metric_prior_mae_sum += (
+                    raw_prior.mean(dim=-1) * active_slot_mask
+                ).sum()
+                batch_metric_post_mae_sum += (
+                    raw_post.mean(dim=-1) * active_slot_mask
+                ).sum()
 
                 total_active_slot_steps += num_active
 
-        # Normalization
         final_assoc_loss = batch_loss_assoc_sum / total_valid_assoc_steps
         final_assoc_acc = batch_metric_assoc_acc_sum / total_valid_assoc_steps
 
@@ -289,7 +335,7 @@ def train_one_epoch(
         final_prior_mae = batch_metric_prior_mae_sum / total_active_slot_steps
 
         final_posterior_loss = batch_loss_posterior_sum / total_active_slot_steps
-        final_posterior_mae = batch_metric_post_mae_sum / total_active_slot_steps
+        final_mae = batch_metric_post_mae_sum / total_active_slot_steps
 
         gamma, lam, alpha = 1.0, 5.0, 2.0
         final_loss = (
@@ -306,27 +352,18 @@ def train_one_epoch(
         total_epoch_loss += final_loss.item()
         global_step = epoch_index * len(loader) + batch_idx
 
-        # Logging Breakout
         writer.add_scalar("Train/Loss_Total", final_loss.item(), global_step)
-
         writer.add_scalar("Train/Loss_Assoc", final_assoc_loss.item(), global_step)
         writer.add_scalar("Train/Acc_Assoc", final_assoc_acc.item(), global_step)
-
         writer.add_scalar("Train/Loss_Prior", final_prior_loss.item(), global_step)
         writer.add_scalar("Train/MAE_Prior", final_prior_mae.item(), global_step)
-
         writer.add_scalar(
             "Train/Loss_Posterior", final_posterior_loss.item(), global_step
         )
-        writer.add_scalar(
-            "Train/MAE_Posterior", final_posterior_mae.item(), global_step
-        )
+        writer.add_scalar("Train/MAE_Posterior", final_mae.item(), global_step)
 
         pbar.set_postfix(
-            {
-                "Loss": f"{final_loss.item():.2f}",
-                "PostMAE": f"{final_posterior_mae.item():.2f}",
-            }
+            {"Loss": f"{final_loss.item():.2f}", "MAE": f"{final_mae.item():.2f}"}
         )
 
         if batch_idx == 0:
@@ -335,18 +372,20 @@ def train_one_epoch(
                 epoch_index,
                 batch_data,
                 posterior_pred_states,
+                dataset_stats,
                 tag="Train/XY_Plot",
             )
 
     return total_epoch_loss / len(loader)
 
 
-def validate_one_epoch(model, loader, device, writer, epoch_index):
+def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats):
     model.eval()
     total_epoch_loss = 0
     l1_loss_fn = nn.L1Loss(reduction="none")
+    loss_weights = get_curriculum_weights(epoch_index, device)
 
-    # Validation Averaging Accumulators
+    # Accumulators for Epoch Averages
     avg_assoc_loss = 0.0
     avg_assoc_acc = 0.0
     avg_prior_loss = 0.0
@@ -376,7 +415,6 @@ def validate_one_epoch(model, loader, device, writer, epoch_index):
                 (batch_size, num_track_slots), -1, dtype=torch.long
             ).to(device)
 
-            # Batch Accumulators
             batch_loss_assoc_sum = 0.0
             batch_metric_assoc_acc_sum = 0.0
             batch_loss_prior_sum = 0.0
@@ -429,7 +467,6 @@ def validate_one_epoch(model, loader, device, writer, epoch_index):
                     active_slot_mask * is_step_valid.unsqueeze(-1).float()
                 )
 
-                # --- Association ---
                 loss_assoc = F.binary_cross_entropy_with_logits(
                     pred_assoc_logits[:, :, t, :], target_assoc_map, reduction="none"
                 )
@@ -445,36 +482,34 @@ def validate_one_epoch(model, loader, device, writer, epoch_index):
 
                 total_valid_assoc_steps += is_step_valid.sum()
 
-                # --- Regression ---
                 num_active = active_slot_mask.sum()
                 if num_active > 0:
-                    l_prior = l1_loss_fn(
+                    raw_prior = l1_loss_fn(
                         prior_pred_states[:, :, t, :], aligned_gt_prior
-                    ).mean(dim=-1)
-                    batch_loss_prior_sum += (l_prior * active_slot_mask).sum()
-
-                    mae_prior = F.l1_loss(
-                        prior_pred_states[:, :, t, :],
-                        aligned_gt_prior,
-                        reduction="none",
-                    ).mean(dim=-1)
-                    batch_metric_prior_mae_sum += (mae_prior * active_slot_mask).sum()
-
-                    l_posterior = l1_loss_fn(
+                    )
+                    raw_post = l1_loss_fn(
                         posterior_pred_states[:, :, t, :], aligned_gt_posterior
-                    ).mean(dim=-1)
-                    batch_loss_posterior_sum += (l_posterior * active_slot_mask).sum()
+                    )
 
-                    mae_post = F.l1_loss(
-                        posterior_pred_states[:, :, t, :],
-                        aligned_gt_posterior,
-                        reduction="none",
-                    ).mean(dim=-1)
-                    batch_metric_post_mae_sum += (mae_post * active_slot_mask).sum()
+                    weighted_prior = raw_prior * loss_weights.view(1, 1, -1)
+                    weighted_post = raw_post * loss_weights.view(1, 1, -1)
+
+                    batch_loss_prior_sum += (
+                        weighted_prior.sum(dim=-1) * active_slot_mask
+                    ).sum()
+                    batch_loss_posterior_sum += (
+                        weighted_post.sum(dim=-1) * active_slot_mask
+                    ).sum()
+
+                    batch_metric_prior_mae_sum += (
+                        raw_prior.mean(dim=-1) * active_slot_mask
+                    ).sum()
+                    batch_metric_post_mae_sum += (
+                        raw_post.mean(dim=-1) * active_slot_mask
+                    ).sum()
 
                     total_active_slot_steps += num_active
 
-            # Normalization per batch
             final_assoc_loss = batch_loss_assoc_sum / total_valid_assoc_steps
             final_assoc_acc = batch_metric_assoc_acc_sum / total_valid_assoc_steps
             final_prior_loss = batch_loss_prior_sum / total_active_slot_steps
@@ -505,21 +540,18 @@ def validate_one_epoch(model, loader, device, writer, epoch_index):
                     epoch_index,
                     batch_data,
                     posterior_pred_states,
+                    dataset_stats,
                     tag="Validation/XY_Plot",
                 )
 
-    # Logging Epoch Averages
     loader_len = len(loader)
     writer.add_scalar(
         "Validation/Loss_Total", total_epoch_loss / loader_len, epoch_index
     )
-
     writer.add_scalar("Validation/Loss_Assoc", avg_assoc_loss / loader_len, epoch_index)
     writer.add_scalar("Validation/Acc_Assoc", avg_assoc_acc / loader_len, epoch_index)
-
     writer.add_scalar("Validation/Loss_Prior", avg_prior_loss / loader_len, epoch_index)
     writer.add_scalar("Validation/MAE_Prior", avg_prior_mae / loader_len, epoch_index)
-
     writer.add_scalar(
         "Validation/Loss_Posterior", avg_post_loss / loader_len, epoch_index
     )
@@ -527,7 +559,7 @@ def validate_one_epoch(model, loader, device, writer, epoch_index):
         "Validation/MAE_Posterior", avg_post_mae / loader_len, epoch_index
     )
 
-    return total_epoch_loss / loader_len
+    return total_epoch_loss / len(loader)
 
 
 if __name__ == "__main__":
@@ -539,7 +571,7 @@ if __name__ == "__main__":
     VAL_OWN = "data/val_ownship.csv"
     MODEL_CHECKPOINT_DIR = "checkpoint"
     LOG_DIR = "runs/stt"
-    MODEL_INIT_WEIGHTS_PATH = ""  # checkpoint/best_stt_model.pth"
+    MODEL_INIT_WEIGHTS_PATH = ""
 
     BATCH_SIZE = 20
     MAX_SEQUENCE_LENGTH = 60
@@ -549,7 +581,7 @@ if __name__ == "__main__":
     DETECT_NUM_DIMS = 9
     SENSOR_TYPE_EMBEDDING_DIM = 8
     EMBEDDING_DIM = 256
-    NUM_EPOCHS = 200
+    NUM_EPOCHS = 250
 
     writer = SummaryWriter(LOG_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -571,6 +603,7 @@ if __name__ == "__main__":
         seq_len=MAX_SEQUENCE_LENGTH,
         max_num_detects_per_step=MAX_NUM_DETECTS_PER_STEP,
         device=device,
+        stats=train_dataset.get_stats(),
     )
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=True)
 
@@ -600,11 +633,14 @@ if __name__ == "__main__":
                 train_loader,
                 optimizer,
                 device,
-                train_dataset.max_num_truth_entities,
+                train_dataset.max_num_truth_objs,
                 writer,
                 epoch,
+                train_dataset.get_stats(),
             )
-            val_loss = validate_one_epoch(model, val_loader, device, writer, epoch)
+            val_loss = validate_one_epoch(
+                model, val_loader, device, writer, epoch, val_dataset.get_stats()
+            )
             print(
                 f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
             )
@@ -619,6 +655,3 @@ if __name__ == "__main__":
     finally:
         writer.close()
         print("TensorBoard writer closed.")
-
-
-# TODO: Could it be a cold start issue where i am running the tsd on a blank or uninitted token?
