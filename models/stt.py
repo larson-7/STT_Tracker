@@ -350,38 +350,33 @@ class STTTracker(nn.Module):
         self.to(device)
 
     def forward(self, batch):
-        features = batch["obs_features"]  # [B, Seq, Max_Dets, Dim]
+        # TODO: incorporate ownship position, run through encoder, stack and cross attend before TDI module?
+        # TODO gate queries based on prior_kin (maybe var too via BD distance?) with the tracks and detections
+        features = batch["obs_features"]
         sensor_ids = batch["obs_ids"]
         mask = batch["obs_mask"]
-        # TODO: incorporate ownship position, run through encoder, stack and cross attend before TDI module?
 
         batch_size, seq_len, max_dets, _ = features.shape
         flat_feats = features.view(-1, features.shape[-1])
         flat_ids = sensor_ids.view(-1, 1)
         encoded_dets = self.detection_encoder(flat_feats, flat_ids)
 
-        # Reshape to [Batch, Seq, Max_Detections, Embed_Dim]
         encoded_dets = encoded_dets.view(
             batch_size, seq_len, max_dets, self.embedding_dim
         )
         mask_expanded = mask.unsqueeze(-1).expand_as(encoded_dets)
         encoded_dets = encoded_dets * mask_expanded.float()
 
-        # Expand the detections so each of the N tracks sees the scene.
-        # New Shape: [Batch * Num_Tracks, Seq, Max_Detections, Embed_Dim]
         encoded_dets_expanded = encoded_dets.repeat_interleave(self.num_tracks, dim=0)
         mask_expanded = mask.repeat_interleave(self.num_tracks, dim=0)
 
-        # Initialize History for ALL N tracks
-        # Queries: [Batch, Num_Tracks, Embed_Dim]
+        # on first detection, "snap" to initial position
         init_queries = self.track_query_embed.expand(batch_size, -1, -1)
-
-        # Fold into effective batch: [Batch * Num_Tracks, 1, Embed_Dim]
-        track_history = init_queries.reshape(
+        bootstrap_query = init_queries.reshape(
             batch_size * self.num_tracks, 1, self.embedding_dim
         )
+        track_history = None
 
-        # Storage for outputs
         all_prior_kinematics = []
         all_prior_variances = []
         all_posterior_kinematics = []
@@ -389,47 +384,48 @@ class STTTracker(nn.Module):
         all_association_scores = []
 
         for t in range(seq_len):
-            # Context: [Batch * Num_Tracks, Max_Detections, Embed_Dim]
             current_context = encoded_dets_expanded[:, t, :, :]
             current_padding_mask = ~mask_expanded[:, t, :]
 
-            track_query = self.temporal_encoder(track_history)  # [Batch * N, Dim]
-            track_query = track_query.unsqueeze(1)  # [Batch * N, 1, Dim]
+            if track_history is None:
+                # We skip the TemporalEncoder because there is no history yet.
+                track_query = bootstrap_query
+            else:
+                track_query = self.temporal_encoder(track_history)
+                track_query = track_query.unsqueeze(1)
 
             prior_kin, prior_var = self.prior_state_decoder(track_query)
 
-            # TODO gate queries based on prior_kin (maybe var too via BD distance?) with the tracks and detections
-
-            # Each track slot attends to the same detections, but has a different query vector
             updated_embedding, assoc_score, _ = self.tdi_module(
                 track_query, current_context, key_padding_mask=current_padding_mask
             )
 
-            # Decode
             posterior_kin, posterior_var = self.posterior_state_decoder(
                 updated_embedding
             )
+
             all_prior_kinematics.append(prior_kin.squeeze(1))
             all_prior_variances.append(prior_var.squeeze(1))
             all_posterior_kinematics.append(posterior_kin.squeeze(1))
             all_posterior_variances.append(posterior_var.squeeze(1))
             all_association_scores.append(assoc_score.squeeze(1))
 
-            # Update History
-            track_history = torch.cat([track_history, updated_embedding], dim=1)
+            if track_history is None:
+                # Overwrite history with the first embedding.
+                # History becomes: [State_0] (NOT [Init, State_0])
+                track_history = updated_embedding
+            else:
+                track_history = torch.cat([track_history, updated_embedding], dim=1)
+
             if track_history.shape[1] > self.max_history_len:
                 track_history = track_history[:, -self.max_history_len :, :]
 
-        # Unfold / Reshape Output
-        # Stack time: [Batch * Num_Tracks, Seq_Len, State_Dim]
         prior_kinematics_stacked = torch.stack(all_prior_kinematics, dim=1)
         prior_variances_stacked = torch.stack(all_prior_variances, dim=1)
         posterior_kinematics_stacked = torch.stack(all_posterior_kinematics, dim=1)
         posterior_variance_stacked = torch.stack(all_posterior_variances, dim=1)
         scores_stacked = torch.stack(all_association_scores, dim=1)
 
-        # Reshape to separate Batch and Tracks
-        # Final Shape: [Batch, Num_Tracks, Seq_Len, State_Dim]
         def unfold(tensor):
             _, s_len, dim = tensor.shape
             return tensor.view(batch_size, self.num_tracks, s_len, dim)
