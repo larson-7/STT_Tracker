@@ -337,7 +337,7 @@ def train_one_epoch(
         final_posterior_loss = batch_loss_posterior_sum / total_active_slot_steps
         final_mae = batch_metric_post_mae_sum / total_active_slot_steps
 
-        gamma, lam, alpha = 1.0, 5.0, 2.0
+        gamma, lam, alpha = 0.1, 1.0, 5.0
         final_loss = (
             (gamma * final_assoc_loss)
             + (lam * final_prior_loss)

@@ -56,7 +56,9 @@ def generate_ownship_path(
     """
     Generates Ownship trajectory with various maneuver scenarios.
     """
-    scenario_type = np.random.choice(list(SCENARIO_MAP.keys()))
+    scenario_type = np.random.choice(
+        list(k for k in SCENARIO_MAP.keys() if k != "sanity_check")
+    )
 
     # Initial State (Origin)
     x, y, z = 0, 0, 0
@@ -226,7 +228,90 @@ def create_sensor_tracker_components(measurement_model):
     }
 
 
-# --- Simulation Runner ---
+def run_sanity_episode(episode_id, start_time, duration):
+    """
+    Replaces run_episode.
+    Generates RANDOM linear trajectories (y = mx + b) for every episode.
+    Input (Track) and Output (Truth) are still identical (sanity check).
+    """
+    episode_tracks_rows = []
+    episode_gt_rows = []
+    episode_ownship_rows = []
+
+    # Random Start Position (Intercept 'b')
+    # We keep z higher to simulate an aerial or distinct object
+    start_x = np.random.uniform(-50, 50)
+    start_y = np.random.uniform(-50, 50)
+    start_z = np.random.uniform(20, 80)
+
+    # Random Velocity (Slope 'm')
+    # Range [-3, 3] ensures visible movement (~180m over 60 frames)
+    vel_x = np.random.uniform(-3.0, 3.0)
+    vel_y = np.random.uniform(-3.0, 3.0)
+    vel_z = np.random.uniform(-3.0, 3.0)
+
+    for k in range(duration):
+        # Time t
+        t = float(k)
+
+        # Pos = Start + (Vel * Time)
+        pos_x = start_x + (vel_x * t)
+        pos_y = start_y + (vel_y * t)
+        pos_z = start_z + (vel_z * t)
+
+        episode_gt_rows.append(
+            [
+                episode_id,
+                k,
+                0,  # Object ID 0
+                pos_x,
+                pos_y,
+                pos_z,
+                vel_x,
+                vel_y,
+                vel_z,
+                0.0,
+                0.0,
+                0.0,  # Acc is zero for linear motion
+            ]
+        )
+
+        # We stay at 0,0,0 to ensure relative coordinates don't complicate the proof
+        episode_ownship_rows.append(
+            [episode_id, k, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, SCENARIO_MAP["sanity_check"]]
+        )
+
+        # This tests if the model can dynamically adapt to *any* line provided in the input.
+        sensor_id = SENSOR_MAP["Modality_A"]
+
+        episode_tracks_rows.append(
+            [
+                episode_id,
+                k,
+                pos_x,
+                pos_y,
+                pos_z,  # Matches Truth
+                vel_x,
+                vel_y,
+                vel_z,  # Matches Truth
+                0.0,
+                0.0,
+                0.0,
+                0.01,
+                0.01,
+                0.01,  # Tiny variance
+                sensor_id,
+                0,  # Truth ID match
+            ]
+        )
+
+    return (
+        np.array(episode_tracks_rows),
+        np.array(episode_gt_rows),
+        np.array(episode_ownship_rows),
+    )
+
+
 def run_episode(
     episode_id,
     start_time,
@@ -324,7 +409,6 @@ def run_episode(
 
                 true_detection = False
                 # Attempt True Detection
-                # Roll against Pd to see if the sensor 'sees' the object
                 if np.random.rand() <= det_prob:
                     meas = model.function(state, noise=True)
                     detections.add(
@@ -337,23 +421,14 @@ def run_episode(
                     )
                     true_detection = True
 
-                # Attempt Target-Generated Clutter (Glint/Multipath)
-                # We perform a SECOND roll against det_prob.
-                # This ensures that if we are turned away (det_prob=0), we generate NO clutter.
-                # If we are at the edge of the envelope (det_prob=0.4), clutter is less likely.
+                # Attempt Target-Generated Clutter
                 if not true_detection and np.random.rand() <= det_prob:
-                    # Determine number of clutter points for this specific target
                     n_clutter = np.random.poisson(config["clutter"])
-
-                    # Get the true position in measurement space (clean center)
                     true_pos_meas = model.function(state, noise=False)
 
                     for _ in range(n_clutter):
-                        # Generate offsets centered on the target
-                        # Standard deviation of 10.0 simulates the 'cloud' around the object
                         offset = np.random.normal(0, 10.0, (3, 1))
                         clutter_pos = true_pos_meas + offset
-
                         detections.add(
                             Clutter(
                                 clutter_pos,
@@ -428,32 +503,33 @@ def run_episode(
 
 
 def main():
+    USE_SANITY_CHECK = False
+
     ensure_dir(OUTPUT_DIR)
     start_time = datetime.now().replace(microsecond=0)
     max_num_objects = 1
 
     # --- FORMAT SPECIFICATIONS ---
-    # These lists enforce the output types for CSV saving.
-    # %d = Integer, %.6f = Float with 6 decimals.
-
-    # Tracks: [episode, frame] (ints) + 12 floats + [sensor, truth] (ints)
     fmt_tracks = ["%d", "%d"] + ["%.6f"] * 12 + ["%d", "%d"]
-
-    # Truth: [episode, frame, object] (ints) + 9 floats
     fmt_gt = ["%d", "%d", "%d"] + ["%.6f"] * 9
-
-    # Ownship: [episode, frame] (ints) + 6 floats + [scenario] (int)
     fmt_own = ["%d", "%d"] + ["%.6f"] * 6 + ["%d"]
 
-    # Headers
     header_tracks = "episode_id,frame_idx,x,y,z,vx,vy,vz,ax,ay,az,var_x,var_y,var_z,sensor_id,truth_id"
     header_gt = "episode_id,frame_idx,object_id,x,y,z,vx,vy,vz,ax,ay,az"
     header_own = "episode_id,frame_idx,x,y,z,vx,vy,vz,scenario_code"
 
-    print(f"Generating {TRAIN_SAMPLES} Training Episodes...")
+    mode_label = "SANITY CHECK" if USE_SANITY_CHECK else "STANDARD"
+    print(f"Generating {TRAIN_SAMPLES} Training Episodes (Mode: {mode_label})...")
+
     t_tracks, t_gt, t_own = [], [], []
     for i in tqdm(range(TRAIN_SAMPLES)):
-        tracks, gt, own = run_episode(i, start_time, DURATION_FRAMES, max_num_objects)
+        if USE_SANITY_CHECK:
+            tracks, gt, own = run_sanity_episode(i, start_time, DURATION_FRAMES)
+        else:
+            tracks, gt, own = run_episode(
+                i, start_time, DURATION_FRAMES, max_num_objects
+            )
+
         t_tracks.append(tracks)
         t_gt.append(gt)
         t_own.append(own)
@@ -484,12 +560,16 @@ def main():
         fmt=fmt_own,
     )
 
-    print(f"Generating {VAL_SAMPLES} Validation Episodes...")
+    print(f"Generating {VAL_SAMPLES} Validation Episodes (Mode: {mode_label})...")
     v_tracks, v_gt, v_own = [], [], []
     for i in tqdm(range(VAL_SAMPLES)):
-        tracks, gt, own = run_episode(
-            i + 1000, start_time, DURATION_FRAMES, max_num_objects
-        )
+        if USE_SANITY_CHECK:
+            tracks, gt, own = run_sanity_episode(i + 1000, start_time, DURATION_FRAMES)
+        else:
+            tracks, gt, own = run_episode(
+                i + 1000, start_time, DURATION_FRAMES, max_num_objects
+            )
+
         v_tracks.append(tracks)
         v_gt.append(gt)
         v_own.append(own)
