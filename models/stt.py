@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NEAR_NEG_INF = -1e9
+NEAR_NEG_INF = -1e4
 
 
 # TODO: Incorporate this for variance predictions
@@ -89,9 +89,6 @@ class TemporalEncoder(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
 
-        # Scale down PE to prevent it from dominating
-        pe = pe * 0.1  # or pe / math.sqrt(hidden_dim)
-
         self.register_buffer("pe", pe.unsqueeze(0))
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -119,22 +116,7 @@ class TemporalEncoder(nn.Module):
         if seq_len == 1:
             temporal_features = x
         else:
-            mask = torch.triu(
-                torch.full(
-                    (seq_len, seq_len),
-                    NEAR_NEG_INF,
-                    device=track_history.device,
-                    dtype=track_history.dtype,
-                ),
-                diagonal=1,
-            )
-
-            temporal_features = self.transformer_encoder(x, mask=mask)
-
-            # Safety check after transformer
-            if torch.isnan(temporal_features).any():
-                print("WARNING: NaN detected after transformer!")
-                temporal_features = torch.nan_to_num(temporal_features, nan=0.0)
+            temporal_features = self.transformer_encoder(x)
 
         # The 'History Query' is the last token
         history_query = temporal_features[:, -1, :]  # [Batch, Hidden_Dim]
@@ -143,6 +125,12 @@ class TemporalEncoder(nn.Module):
         final_track_query = self.fusion_proj(combined)
 
         final_track_query = self.norm(final_track_query)
+
+        # Explicit NaN/Inf checks after LayerNorm with fallback to zeros
+        if torch.isnan(final_track_query).any() or torch.isinf(final_track_query).any():
+            final_track_query = torch.nan_to_num(
+                final_track_query, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
         return final_track_query
 
@@ -233,9 +221,10 @@ class TrackDetectionInteraction(nn.Module):
             .transpose(1, 2)
         )
 
-        # Matrix Mult: (B, Heads, N_tracks, Head_Dim) @ (B, Heads, Head_Dim, N_dets)
         # Output: [B, Heads, N_tracks, N_dets]
         attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        # Clamp logits before softmax to prevent overflow
+        attn_logits = torch.clamp(attn_logits, min=-100.0, max=100.0)
 
         if key_padding_mask is not None:
             mask_expanded = key_padding_mask.view(B, 1, 1, N_dets)
@@ -256,8 +245,26 @@ class TrackDetectionInteraction(nn.Module):
 
         # Final Projection, Residual, and FFN
         out = self.out_proj(out)
-        updated_embedding = self.norm(track_query + out)
+
+        # Explicit NaN/Inf checks after LayerNorm with fallback to zeros
+        fused = track_query + out
+        if torch.isnan(fused).any() or torch.isinf(fused).any():
+            fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
+
+        updated_embedding = self.norm(fused)
+
+        # Explicit NaN/Inf checks after LayerNorm with fallback to zeros
+        if torch.isnan(updated_embedding).any() or torch.isinf(updated_embedding).any():
+            updated_embedding = torch.nan_to_num(
+                updated_embedding, nan=0.0, posinf=0.0, neginf=0.0
+            )
+
         updated_embedding = updated_embedding + self.ffn(updated_embedding)
+
+        if torch.isnan(updated_embedding).any() or torch.isinf(updated_embedding).any():
+            updated_embedding = torch.nan_to_num(
+                updated_embedding, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
         # Sigmoid association scores used during inference
         # We allow the model to predict "0" for everything if no match exists
@@ -328,7 +335,9 @@ class STTTracker(nn.Module):
 
         # Learn distinct embeddings for each of the N track slots
         # Shape: [1, Num_Tracks, Embed_Dim]
-        self.track_query_embed = nn.Parameter(torch.randn(1, num_tracks, embedding_dim))
+        self.track_query_embed = nn.Parameter(torch.empty(1, num_tracks, embedding_dim))
+        nn.init.xavier_uniform_(self.track_query_embed, gain=0.1)
+
         self.bootstrap_norm = nn.LayerNorm(embedding_dim)
 
     def load_weights(
@@ -413,6 +422,8 @@ class STTTracker(nn.Module):
 
         # on first detection, "snap" to initial position
         init_queries = self.bootstrap_norm(self.track_query_embed)
+        init_queries = torch.clamp(init_queries, min=-10.0, max=10.0)
+
         init_queries = init_queries.expand(batch_size, -1, -1)
         bootstrap_query = init_queries.reshape(
             batch_size * self.num_tracks, 1, self.embedding_dim
