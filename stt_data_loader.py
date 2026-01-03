@@ -12,9 +12,9 @@ class TrackingDataset(Dataset):
         ownship_file,
         seq_len=5,
         max_num_detects_per_step=3,
-        device="cpu",
+        device: torch.device | str = "cpu",
         # Allow passing pre-computed stats so Train and Val use SAME scaling
-        stats: dict = None,
+        stats: dict | None = None,
     ):
         self.seq_len = seq_len
         self.max_num_detects_per_step = max_num_detects_per_step

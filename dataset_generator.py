@@ -23,9 +23,10 @@ from stonesoup.initiator.simple import MultiMeasurementInitiator
 
 # --- Configuration ---
 OUTPUT_DIR = "data"
-TRAIN_SAMPLES = 1000
-VAL_SAMPLES = 200
+TRAIN_SAMPLES = 100
+VAL_SAMPLES = 20
 DURATION_FRAMES = 60
+MAX_NUM_OBJECTS = 3
 
 # Map sensor names to integer IDs
 SENSOR_MAP = {
@@ -507,7 +508,7 @@ def main():
 
     ensure_dir(OUTPUT_DIR)
     start_time = datetime.now().replace(microsecond=0)
-    max_num_objects = 1
+    max_num_objects = MAX_NUM_OBJECTS
 
     # --- FORMAT SPECIFICATIONS ---
     fmt_tracks = ["%d", "%d"] + ["%.6f"] * 12 + ["%d", "%d"]

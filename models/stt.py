@@ -30,7 +30,12 @@ class DetectionEncoder(nn.Module):
 
         # Dedicated embedding for the sensor type
         self.unknown_idx = num_sensor_types
-        self.sensor_embedding = nn.Embedding(num_sensor_types + 1, embed_dim)
+        # Set padding_idx to prevent gradient updates for unknown sensors
+        self.sensor_embedding = nn.Embedding(
+            num_sensor_types + 1, embed_dim, padding_idx=self.unknown_idx
+        )
+
+        nn.init.uniform_(self.sensor_embedding.weight, -0.1, 0.1)
         combined_dim = input_dim + embed_dim
 
         self.mlp = nn.Sequential(
@@ -60,63 +65,91 @@ class DetectionEncoder(nn.Module):
 
 class TemporalEncoder(nn.Module):
     """
-    Fuses the history of track embeddings into a single 'Track Query'.
+    Fuses the history of track embeddings into a single 'Track Query' with also considering the ownship context.
     Input: Sequence of past track embeddings (history).
     Output: Single vector 'track_query'.
     """
 
-    def __init__(self, hidden_dim=256, nhead=4, num_layers=2, max_len=5000):
+    pe: torch.Tensor
+
+    def __init__(
+        self, hidden_dim=256, nhead=4, num_layers=2, max_len=5000, ownship_dim=6
+    ):
         super().__init__()
 
-        # Setup Standard Sinusoidal Positional Encoding
-        # We register this as a buffer so it saves with state_dict but isn't a learned parameter
         pe = torch.zeros(max_len, hidden_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        # Use double precision for stability
         div_term = torch.exp(
-            torch.arange(0, hidden_dim, 2).float() * (-math.log(10000.0) / hidden_dim)
-        )
+            torch.arange(0, hidden_dim, 2, dtype=torch.float64)
+            * (-math.log(10000.0) / hidden_dim)
+        ).float()
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
 
-        # Shape: [1, Max_Len, Hidden_Dim] for broadcasting
+        # Scale down PE to prevent it from dominating
+        pe = pe * 0.1  # or pe / math.sqrt(hidden_dim)
+
         self.register_buffer("pe", pe.unsqueeze(0))
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=nhead, batch_first=True
+            d_model=hidden_dim, nhead=nhead, batch_first=True, norm_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
+        self.ownship_mlp = nn.Sequential(
+            nn.Linear(ownship_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+        )
+        self.fusion_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, track_history):
+    def forward(self, track_history, ownship_state):
         """
         track_history: [Batch, History_Length, Hidden_Dim]
+        ownship_state: [Batch, Ownship_Dim]
         """
         seq_len = track_history.size(1)
-
-        # Add Positional Encoding to the input
-        # We slice the pre-computed PE to match the current sequence length
-        # track_history + pe[:seq_len]
         x = track_history + self.pe[:, :seq_len, :]
 
-        # Create Causal Mask
-        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(
-            track_history.device
-        )
+        if seq_len == 1:
+            temporal_features = x
+        else:
+            mask = torch.triu(
+                torch.full(
+                    (seq_len, seq_len),
+                    NEAR_NEG_INF,
+                    device=track_history.device,
+                    dtype=track_history.dtype,
+                ),
+                diagonal=1,
+            )
 
-        # Apply the mask during the forward pass
-        temporal_features = self.transformer_encoder(x, mask=mask, is_causal=True)
+            temporal_features = self.transformer_encoder(x, mask=mask)
 
-        # Take the last valid token as the query for current timestep
-        track_query = temporal_features[:, -1, :]
+            # Safety check after transformer
+            if torch.isnan(temporal_features).any():
+                print("WARNING: NaN detected after transformer!")
+                temporal_features = torch.nan_to_num(temporal_features, nan=0.0)
 
-        return track_query
+        # The 'History Query' is the last token
+        history_query = temporal_features[:, -1, :]  # [Batch, Hidden_Dim]
+        ownship_embed = self.ownship_mlp(ownship_state)  # [Batch, Hidden_Dim]
+        combined = torch.cat([history_query, ownship_embed], dim=-1)
+        final_track_query = self.fusion_proj(combined)
+
+        final_track_query = self.norm(final_track_query)
+
+        return final_track_query
 
 
 class TrackDetectionInteraction(nn.Module):
     """
-    "White Box" Transformer Attention Block.
+    Transformer Attention Block.
 
     Performs Cross-Attention between 'track_query' and 'context_detections'.
     Unlike standard nn.MultiheadAttention, this exposes the raw attention logits
@@ -205,11 +238,15 @@ class TrackDetectionInteraction(nn.Module):
         attn_logits = (q @ k.transpose(-2, -1)) * self.scale
 
         if key_padding_mask is not None:
-            # key_padding_mask: [B, N_dets] -> Expand to [B, 1, 1, N_dets]
             mask_expanded = key_padding_mask.view(B, 1, 1, N_dets)
             attn_logits = attn_logits.masked_fill(mask_expanded, NEAR_NEG_INF)
 
         attn_weights = F.softmax(attn_logits, dim=-1)
+
+        # Handle all-padded rows
+        attn_weights = torch.where(
+            torch.isnan(attn_weights), torch.zeros_like(attn_weights), attn_weights
+        )
 
         # Weighted sum of Values: [B, Heads, N_tracks, Head_Dim]
         out = attn_weights @ v
@@ -231,12 +268,6 @@ class TrackDetectionInteraction(nn.Module):
 
 
 class TrackStateDecoder(nn.Module):
-    """
-    Decodes the abstract embedding back into a physical kinematic state.
-    Input: The updated track embedding from the TDI.
-    Output: State vector (e.g., x, y, z, vx, vy, ax, ay).
-    """
-
     def __init__(self, hidden_dim=256, state_dim=10):
         super().__init__()
         self.decoder_mlp = nn.Sequential(
@@ -245,17 +276,22 @@ class TrackStateDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
         )
-        # Separate heads for mean and log variance
-        self.state_head = nn.Linear(hidden_dim // 2, state_dim)  # kinematics
-        self.log_var_head = nn.Linear(hidden_dim // 2, state_dim)  # uncertainties
+        self.state_head = nn.Linear(hidden_dim // 2, state_dim)
+        self.log_var_head = nn.Linear(hidden_dim // 2, state_dim)
+
+        # Initialize log_var head to predict small variances initially
+        torch.nn.init.constant_(self.log_var_head.weight, 0)
+        torch.nn.init.constant_(
+            self.log_var_head.bias, -1.0
+        )  # Start with exp(-1) variance
 
     def forward(self, updated_track_embedding):
         features = self.decoder_mlp(updated_track_embedding)
 
-        kinematics = self.state_head(features)  # [B, 1, 9]
-        log_variance = self.log_var_head(features)  # [B, 1, 9]
+        kinematics = self.state_head(features)
+        log_variance = self.log_var_head(features)
+        log_variance = torch.clamp(log_variance, min=-10.0, max=10.0)
 
-        # Ensure positive variance
         variance = torch.exp(log_variance)
 
         return kinematics, variance
@@ -269,12 +305,14 @@ class STTTracker(nn.Module):
         sensor_type_embedding_dim: int = 16,
         num_sensor_modalities: int = 3,
         embedding_dim: int = 256,
+        ownship_dim: int = 6,
         max_history_len: int = 1000,
     ):
         super().__init__()
         self.num_tracks = num_tracks
         self.embedding_dim = embedding_dim
         self.max_history_len = max_history_len
+        self.ownship_dim = ownship_dim
 
         self.detection_encoder = DetectionEncoder(
             input_dim=input_dim,
@@ -283,7 +321,7 @@ class STTTracker(nn.Module):
             out_dim=embedding_dim,
         )
 
-        self.temporal_encoder = TemporalEncoder(embedding_dim)
+        self.temporal_encoder = TemporalEncoder(embedding_dim, ownship_dim=ownship_dim)
         self.tdi_module = TrackDetectionInteraction(embedding_dim)
         self.prior_state_decoder = TrackStateDecoder(embedding_dim, input_dim)
         self.posterior_state_decoder = TrackStateDecoder(embedding_dim, input_dim)
@@ -291,8 +329,11 @@ class STTTracker(nn.Module):
         # Learn distinct embeddings for each of the N track slots
         # Shape: [1, Num_Tracks, Embed_Dim]
         self.track_query_embed = nn.Parameter(torch.randn(1, num_tracks, embedding_dim))
+        self.bootstrap_norm = nn.LayerNorm(embedding_dim)
 
-    def load_weights(self, path: str, device: torch.device = None, strict: bool = True):
+    def load_weights(
+        self, path: str, device: torch.device | None = None, strict: bool = True
+    ):
         """
         Loads weights from a .pth file.
 
@@ -350,11 +391,11 @@ class STTTracker(nn.Module):
         self.to(device)
 
     def forward(self, batch):
-        # TODO: incorporate ownship position, run through encoder, stack and cross attend before TDI module?
         # TODO gate queries based on prior_kin (maybe var too via BD distance?) with the tracks and detections
         features = batch["obs_features"]
         sensor_ids = batch["obs_ids"]
         mask = batch["obs_mask"]
+        ownship = batch["ownship"]
 
         batch_size, seq_len, max_dets, _ = features.shape
         flat_feats = features.view(-1, features.shape[-1])
@@ -371,10 +412,12 @@ class STTTracker(nn.Module):
         mask_expanded = mask.repeat_interleave(self.num_tracks, dim=0)
 
         # on first detection, "snap" to initial position
-        init_queries = self.track_query_embed.expand(batch_size, -1, -1)
+        init_queries = self.bootstrap_norm(self.track_query_embed)
+        init_queries = init_queries.expand(batch_size, -1, -1)
         bootstrap_query = init_queries.reshape(
             batch_size * self.num_tracks, 1, self.embedding_dim
         )
+
         track_history = None
 
         all_prior_kinematics = []
@@ -386,12 +429,18 @@ class STTTracker(nn.Module):
         for t in range(seq_len):
             current_context = encoded_dets_expanded[:, t, :, :]
             current_padding_mask = ~mask_expanded[:, t, :]
+            current_ownship = ownship[:, t, :]  # [Batch, Ownship_Dim]
+            current_ownship_expanded = current_ownship.repeat_interleave(
+                self.num_tracks, dim=0
+            )
 
             if track_history is None:
                 # We skip the TemporalEncoder because there is no history yet.
                 track_query = bootstrap_query
             else:
-                track_query = self.temporal_encoder(track_history)
+                track_query = self.temporal_encoder(
+                    track_history, current_ownship_expanded
+                )
                 track_query = track_query.unsqueeze(1)
 
             prior_kin, prior_var = self.prior_state_decoder(track_query)
@@ -450,6 +499,7 @@ if __name__ == "__main__":
     NUM_TRACKS = 20  # The model will output 20 track slots per scene
     NUM_SENSORS = 3  # Radar, Camera, Lidar types
     EMBED_DIM = 256
+    OWNSHIP_DIM = 6
 
     print(f"--- Configuration ---")
     print(f"Batch Size: {BATCH_SIZE}")
@@ -463,6 +513,7 @@ if __name__ == "__main__":
         input_dim=FEAT_DIM,
         num_sensor_modalities=NUM_SENSORS,
         embedding_dim=EMBED_DIM,
+        ownship_dim=OWNSHIP_DIM,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -471,6 +522,9 @@ if __name__ == "__main__":
 
     # Random kinematic features: [Batch, Seq, Max_Dets, Feat_Dim]
     obs_features = torch.randn(BATCH_SIZE, SEQ_LEN, MAX_DETS, FEAT_DIM).to(device)
+
+    # Random ownship features: [Batch, Seq, Feat_Dim]
+    ownship = torch.randn(BATCH_SIZE, SEQ_LEN, OWNSHIP_DIM).to(device)
 
     # Random sensor IDs (0, 1, or 2): [Batch, Seq, Max_Dets, 1]
     obs_ids = torch.randint(0, NUM_SENSORS, (BATCH_SIZE, SEQ_LEN, MAX_DETS, 1)).to(
@@ -482,7 +536,12 @@ if __name__ == "__main__":
     obs_mask = (torch.rand(BATCH_SIZE, SEQ_LEN, MAX_DETS) > 0.3).to(device)
 
     # Pack into dictionary
-    batch = {"obs_features": obs_features, "obs_ids": obs_ids, "obs_mask": obs_mask}
+    batch = {
+        "obs_features": obs_features,
+        "obs_ids": obs_ids,
+        "obs_mask": obs_mask,
+        "ownship": ownship,
+    }
 
     print("Running Forward Pass...")
     outputs = tracker(batch)

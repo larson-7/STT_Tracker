@@ -76,127 +76,166 @@ def log_xy_plot(
     dataset_stats,
     batch_idx=0,
     tag="Tracking/XY_Plot",
+    match_threshold=5.0,
 ):
-    """
-    Logs an XY plot of truth, predictions, and detections.
-    Un-normalizes data using dataset_stats before plotting so axes are in Meters.
-    """
     b = batch_idx
     valid_seq_mask = batch_data["valid_seq_mask"][b].detach().cpu().numpy()
 
-    # Get Normalization Stats
     mu_x, std_x = dataset_stats["x"]["mean"], dataset_stats["x"]["std"]
     mu_y, std_y = dataset_stats["y"]["mean"], dataset_stats["y"]["std"]
 
-    def unnorm(arr_x, arr_y):
-        return (arr_x * std_x + mu_x), (arr_y * std_y + mu_y)
+    def unnorm_traj(arr):
+        x = arr[..., 0] * std_x + mu_x
+        y = arr[..., 1] * std_y + mu_y
+        return x, y
 
-    # Ground Truth
     gt_raw = (
         batch_data["posterior_truth_states"][b].detach().cpu().numpy()[valid_seq_mask]
     )
-    gt_x, gt_y = unnorm(gt_raw[:, :, 0], gt_raw[:, :, 1])
+    gt_x, gt_y = unnorm_traj(gt_raw)
 
-    # Detections
-    det_raw = batch_data["obs_features"][b].detach().cpu().numpy()[valid_seq_mask]
-    det_x, det_y = unnorm(det_raw[:, :, 0], det_raw[:, :, 1])
+    own_raw = batch_data["ownship"][b].detach().cpu().numpy()[valid_seq_mask]
+    own_x, own_y = unnorm_traj(own_raw)
+
+    det_features = batch_data["obs_features"][b].detach().cpu().numpy()[valid_seq_mask]
+    det_x, det_y = unnorm_traj(det_features)
 
     obs_ids = batch_data["obs_ids"][b].detach().cpu().numpy()[valid_seq_mask]
     obs_mask = batch_data["obs_mask"][b].detach().cpu().numpy()[valid_seq_mask]
     truth_ids = batch_data["truth_ids"][b].detach().cpu().numpy()[valid_seq_mask]
 
-    # Predictions
     pred_raw = pred_states[b].detach().cpu().numpy()[:, valid_seq_mask, :]
-    pred_x, pred_y = unnorm(pred_raw[:, :, 0], pred_raw[:, :, 1])
+    pred_x, pred_y = unnorm_traj(pred_raw)
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=(12, 12))
     ax.set_title(f"Epoch {epoch} - {tag} (Units: Meters)")
     ax.grid(True, alpha=0.3)
     cmap = matplotlib.colormaps["tab10"]
 
+    # Plot Ownship
+    ax.plot(
+        own_x,
+        own_y,
+        color="black",
+        linewidth=3,
+        linestyle="--",
+        alpha=0.7,
+        label="Ownship",
+    )
+    ax.scatter(own_x[0], own_y[0], color="black", marker="o", s=50)
+    ax.scatter(own_x[-1], own_y[-1], color="black", marker="X", s=80)
+
     # Plot Ground Truth
+    gt_colors = {}
     _, max_gt, _ = gt_raw.shape
+
     for gt_idx in range(max_gt):
-        px, py = gt_x[:, gt_idx], gt_y[:, gt_idx]
-        if (gt_raw[:, gt_idx, 0] == 0).all() and (gt_raw[:, gt_idx, 1] == 0).all():
+        if (np.abs(gt_raw[:, gt_idx, :2]) < 1e-3).all():
             continue
+
+        c = cmap(gt_idx % 10)
+        gt_colors[gt_idx] = c
+        px, py = gt_x[:, gt_idx], gt_y[:, gt_idx]
+
         ax.plot(
             px,
             py,
-            color=cmap(0),
+            color=c,
             marker="o",
-            markersize=3,
-            alpha=0.4,
-            label="Truth" if gt_idx == 0 else "",
+            markersize=4,
+            alpha=0.5,
+            linewidth=2,
+            label=f"GT {gt_idx}",
         )
+        ax.text(px[-1], py[-1], f"GT{gt_idx}", color=c, fontsize=9, fontweight="bold")
 
     # Plot Predictions
     num_slots, seq_len, _ = pred_raw.shape
-    prediction_color = cmap(1)
+
     for slot_idx in range(num_slots):
-        px, py = pred_x[slot_idx, :], pred_y[slot_idx, :]
-        if (np.abs(pred_raw[slot_idx, :, 0]) < 1e-2).all():
+        if (np.abs(pred_raw[slot_idx, :, :2]) < 1e-2).all():
             continue
+
+        px, py = pred_x[slot_idx, :], pred_y[slot_idx, :]
+
+        best_dist = float("inf")
+        best_gt = -1
+
+        for gt_idx in range(max_gt):
+            if gt_idx not in gt_colors:
+                continue
+
+            gx, gy = gt_x[:, gt_idx], gt_y[:, gt_idx]
+            dist = np.mean(np.sqrt((px - gx) ** 2 + (py - gy) ** 2))
+
+            if dist < best_dist:
+                best_dist = dist
+                best_gt = gt_idx
+
+        if best_dist < match_threshold:
+            color = gt_colors[best_gt]
+            line_style = "-"
+            alpha_val = 0.9
+        else:
+            color = "gray"
+            line_style = ":"
+            alpha_val = 0.4
 
         ax.plot(
             px,
             py,
-            color=prediction_color,
+            color=color,
             marker=">",
             markersize=4,
-            alpha=0.8,
-            linestyle="None",
-            label="Prediction" if slot_idx == 0 else "",
+            linestyle=line_style,
+            alpha=alpha_val,
+            label="Predictions" if slot_idx == 0 else "",
         )
-        for t in range(seq_len):
-            ax.text(
-                px[t],
-                py[t],
-                str(t),
-                fontsize=8,
-                color="black",
-                ha="left",
-                va="bottom",
-                alpha=0.8,
-            )
 
     # Plot Detections
-    seq_len, max_det, _ = det_raw.shape
     plotted_labels = set()
     for t in range(seq_len):
-        for d in range(max_det):
+        for d in range(det_features.shape[1]):
             if not obs_mask[t, d]:
                 continue
-            x, y = det_x[t, d], det_y[t, d]
-            oid = int(obs_ids[t, d])
-            truth_id = int(truth_ids[t, d])
-            marker_type = "*" if truth_id >= 0 else "x"
-            label_suffix = "det" if truth_id >= 0 else "clutter"
 
-            if det_raw[t, d, 0] != 0 or det_raw[t, d, 1] != 0:
-                color = cmap(oid % 10 + 2)
-                label = f"Obs{oid}:{label_suffix}"
-                ax.plot(
-                    x,
-                    y,
-                    marker=marker_type,
-                    markeredgecolor=color,
-                    markerfacecolor="none" if marker_type == "*" else color,
-                    markersize=7 if marker_type == "*" else 5,
-                    alpha=0.7,
-                    linestyle="None",
-                    label=label if label not in plotted_labels else "",
-                )
-                plotted_labels.add(label)
+            tid = int(truth_ids[t, d])
+
+            if tid >= 0:
+                marker = "."
+                sz = 4
+                det_color = gt_colors.get(tid, "black")
+                lbl = "True Det"
+            else:
+                marker = "x"
+                sz = 4
+                det_color = "red"
+                lbl = "Clutter"
+
+            ax.plot(
+                det_x[t, d],
+                det_y[t, d],
+                marker=marker,
+                color=det_color,
+                markersize=sz,
+                linestyle="None",
+                alpha=0.3,
+                label=lbl if lbl not in plotted_labels else "",
+            )
+            plotted_labels.add(lbl)
 
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    sorted_keys = sorted(by_label.keys())
+    sorted_keys = sorted(
+        by_label.keys(), key=lambda x: (0 if "Own" in x else 1 if "GT" in x else 2)
+    )
+
     ax.legend(
         [by_label[k] for k in sorted_keys],
         sorted_keys,
         loc="upper right",
         bbox_to_anchor=(1.15, 1),
+        fontsize="small",
     )
 
     writer.add_figure(tag, fig, global_step=epoch)
@@ -573,18 +612,23 @@ if __name__ == "__main__":
     LOG_DIR = "runs/stt"
     MODEL_INIT_WEIGHTS_PATH = ""
 
-    BATCH_SIZE = 20
+    BATCH_SIZE = 1
     MAX_SEQUENCE_LENGTH = 60
     NUM_SENSOR_MODALITIES = 3
     MAX_NUM_DETECTS_PER_STEP = NUM_SENSOR_MODALITIES**2
-    MAX_NUM_TRACK_SLOTS = 1
+    MAX_NUM_TRACK_SLOTS = 3
     DETECT_NUM_DIMS = 9
     SENSOR_TYPE_EMBEDDING_DIM = 8
     EMBEDDING_DIM = 256
     NUM_EPOCHS = 250
 
     writer = SummaryWriter(LOG_DIR)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     train_dataset = TrackingDataset(
         TRAIN_TRACKS,
