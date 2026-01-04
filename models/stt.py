@@ -156,19 +156,15 @@ class TrackDetectionInteraction(nn.Module):
         self.head_dim = hidden_dim // nhead
         self.scale = self.head_dim**-0.5
 
-        assert (
-            self.head_dim * nhead == hidden_dim
-        ), "Hidden dim must be divisible by nhead"
+        # A constant vector representing "No Detection Found"
+        self.null_obs_embedding = nn.Parameter(torch.empty(1, 1, hidden_dim))
+        nn.init.xavier_uniform_(self.null_obs_embedding, gain=0.1)
 
-        # Q, K, V Projections (Shared by Loss AND State Update)
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        # Output projection for the state update path
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        # Standard Transformer Block components
         self.norm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -182,93 +178,71 @@ class TrackDetectionInteraction(nn.Module):
         context_detections: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            track_query: [Batch, Num_Tracks, Dim]
-                The active track embeddings.
-            context_detections: [Batch, Num_Dets, Dim]
-                The candidate detections for this frame.
-            key_padding_mask: [Batch, Num_Dets]
-                True indicates the index is padding and should be ignored.
 
-        Returns:
-            updated_embedding: [Batch, Num_Tracks, Dim]
-                The track states updated with information from relevant detections.
-            association_logits: [Batch, Num_Tracks, Num_Dets]
-                Raw similarity scores (logits) averaged across heads.
-                Use this with BCEWithLogitsLoss.
-            association_probs: [Batch, Num_Tracks, Num_Dets]
-                Sigmoid-normalized probabilities (0.0 to 1.0).
-                Use this for Hungarian Matching or Thresholding during inference.
-        """
         B, N_tracks, C = track_query.shape
         _, N_dets, _ = context_detections.shape
 
-        # Reshape to [Batch, Num_Elements, Num_Heads, Head_Dim] -> Transpose to [B, Heads, N, Head_Dim]
+        # Expand null token to batch size: [B, 1, C]
+        null_obs = self.null_obs_embedding.expand(B, -1, -1)
+
+        # Concatenate null token to the END of detections
+        # New shape: [B, N_dets + 1, C]
+        context_with_null = torch.cat([context_detections, null_obs], dim=1)
+
+        # Handle Mask: Append 'False' (Not Padding) for the null token so we can always attend to it
+        if key_padding_mask is not None:
+            # key_padding_mask is [B, N_dets]
+            # null_mask is [B, 1] of False (valid)
+            null_mask = torch.zeros(
+                (B, 1), dtype=torch.bool, device=key_padding_mask.device
+            )
+            key_padding_mask_with_null = torch.cat([key_padding_mask, null_mask], dim=1)
+        else:
+            key_padding_mask_with_null = None
+
         q = (
             self.q_proj(track_query)
             .view(B, N_tracks, self.nhead, self.head_dim)
             .transpose(1, 2)
         )
+        # Dimensions will operate on N_dets + 1
         k = (
-            self.k_proj(context_detections)
-            .view(B, N_dets, self.nhead, self.head_dim)
+            self.k_proj(context_with_null)
+            .view(B, N_dets + 1, self.nhead, self.head_dim)
             .transpose(1, 2)
         )
         v = (
-            self.v_proj(context_detections)
-            .view(B, N_dets, self.nhead, self.head_dim)
+            self.v_proj(context_with_null)
+            .view(B, N_dets + 1, self.nhead, self.head_dim)
             .transpose(1, 2)
         )
 
-        # Output: [B, Heads, N_tracks, N_dets]
+        # Attention Logits: [B, Heads, N_tracks, N_dets + 1]
         attn_logits = (q @ k.transpose(-2, -1)) * self.scale
-        # Clamp logits before softmax to prevent overflow
         attn_logits = torch.clamp(attn_logits, min=-100.0, max=100.0)
 
-        if key_padding_mask is not None:
-            mask_expanded = key_padding_mask.view(B, 1, 1, N_dets)
+        # Apply Mask (now includes the Null token slot which is always valid)
+        if key_padding_mask_with_null is not None:
+            mask_expanded = key_padding_mask_with_null.view(B, 1, 1, N_dets + 1)
             attn_logits = attn_logits.masked_fill(mask_expanded, NEAR_NEG_INF)
 
+        # If all real detections have low logits, probability flows to the Null index.
         attn_weights = F.softmax(attn_logits, dim=-1)
 
-        # Handle all-padded rows
-        attn_weights = torch.where(
-            torch.isnan(attn_weights), torch.zeros_like(attn_weights), attn_weights
-        )
-
-        # Weighted sum of Values: [B, Heads, N_tracks, Head_Dim]
         out = attn_weights @ v
-
-        # Reassemble Heads: [B, N_tracks, Hidden_Dim]
         out = out.transpose(1, 2).contiguous().view(B, N_tracks, C)
-
-        # Final Projection, Residual, and FFN
         out = self.out_proj(out)
 
-        # Explicit NaN/Inf checks after LayerNorm with fallback to zeros
         fused = track_query + out
-        if torch.isnan(fused).any() or torch.isinf(fused).any():
-            fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
-
         updated_embedding = self.norm(fused)
-
-        # Explicit NaN/Inf checks after LayerNorm with fallback to zeros
-        if torch.isnan(updated_embedding).any() or torch.isinf(updated_embedding).any():
-            updated_embedding = torch.nan_to_num(
-                updated_embedding, nan=0.0, posinf=0.0, neginf=0.0
-            )
-
         updated_embedding = updated_embedding + self.ffn(updated_embedding)
 
-        if torch.isnan(updated_embedding).any() or torch.isinf(updated_embedding).any():
-            updated_embedding = torch.nan_to_num(
-                updated_embedding, nan=0.0, posinf=0.0, neginf=0.0
-            )
+        # For Association Loss, we only care about the REAL detections.
+        # Slice off the Null Token column from the logits.
+        # Shape becomes: [B, Heads, N_tracks, N_dets]
+        real_det_logits = attn_logits[..., :-1]
 
-        # Sigmoid association scores used during inference
-        # We allow the model to predict "0" for everything if no match exists
-        mean_association_logits = attn_logits.mean(dim=1)
+        mean_association_logits = real_det_logits.mean(dim=1)
         association_probs = mean_association_logits.sigmoid()
 
         return updated_embedding, mean_association_logits, association_probs

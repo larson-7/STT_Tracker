@@ -17,50 +17,17 @@ from stt_data_loader import TrackingDataset
 
 
 def get_curriculum_weights(epoch, device):
-    """
-    Returns a weight tensor [9] for (x,y,z, vx,vy,vz, ax,ay,az).
-
-    Curriculum Strategy:
-    - Epoch 0-50:   Focus ONLY on Position (Vel/Acc weights are negligible).
-    - Epoch 50-100: Ramp up Velocity from 0.0 to 1.0.
-    - Epoch 100+:   Ramp up Acceleration from 0.0 to 0.5.
-    """
-    # Base weights
-    pos_w = 1.0
-
-    vel_start = 50
-    vel_ramp_end = 100
-
-    if epoch < vel_start:
-        # Use a tiny epsilon (1e-4) instead of 0.0 to keep the gradient heads alive
-        # without affecting the loss significantly.
-        vel_w = 1e-4
-    else:
-        # Ramp from 0.0 to 1.0
-        progress = (epoch - vel_start) / (vel_ramp_end - vel_start)
-        vel_w = np.clip(progress, 0.0, 1.0)
-
-    acc_start = 100
-    acc_ramp_end = 150
-
-    if epoch < acc_start:
-        acc_w = 0.0
-    else:
-        # Ramp from 0.0 to 0.5
-        progress = (epoch - acc_start) / (acc_ramp_end - acc_start)
-        acc_w = np.clip(progress * 0.5, 0.0, 0.5)
-
     weights = torch.tensor(
         [
-            pos_w,
-            pos_w,
-            pos_w,  # X, Y, Z
-            vel_w,
-            vel_w,
-            vel_w,  # Vx, Vy, Vz
-            acc_w,
-            acc_w,
-            acc_w,  # Ax, Ay, Az
+            1.0,
+            1.0,
+            1.0,  # Position (X, Y, Z)
+            2.0,
+            2.0,
+            2.0,  # Velocity (Vx, Vy, Vz) - Heavily penalize velocity errors
+            0.1,
+            0.1,
+            0.1,  # Acceleration - Keep low, noisy labels can cause instability
         ],
         device=device,
         dtype=torch.float32,
@@ -376,7 +343,7 @@ def train_one_epoch(
         final_posterior_loss = batch_loss_posterior_sum / total_active_slot_steps
         final_mae = batch_metric_post_mae_sum / total_active_slot_steps
 
-        gamma, lam, alpha = 0.1, 1.0, 5.0
+        gamma, lam, alpha = 2.0, 1.0, 1.0
         final_loss = (
             (gamma * final_assoc_loss)
             + (lam * final_prior_loss)
@@ -612,15 +579,15 @@ if __name__ == "__main__":
     LOG_DIR = "runs/stt"
     MODEL_INIT_WEIGHTS_PATH = ""
 
-    BATCH_SIZE = 1
+    BATCH_SIZE = 20
     MAX_SEQUENCE_LENGTH = 60
     NUM_SENSOR_MODALITIES = 3
     MAX_NUM_DETECTS_PER_STEP = NUM_SENSOR_MODALITIES**2
-    MAX_NUM_TRACK_SLOTS = 3
+    MAX_NUM_TRACK_SLOTS = 1
     DETECT_NUM_DIMS = 9
     SENSOR_TYPE_EMBEDDING_DIM = 8
     EMBEDDING_DIM = 256
-    NUM_EPOCHS = 250
+    NUM_EPOCHS = 1000
 
     writer = SummaryWriter(LOG_DIR)
     if torch.cuda.is_available():

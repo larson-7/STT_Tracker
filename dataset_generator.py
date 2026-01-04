@@ -23,10 +23,10 @@ from stonesoup.initiator.simple import MultiMeasurementInitiator
 
 # --- Configuration ---
 OUTPUT_DIR = "data"
-TRAIN_SAMPLES = 100
-VAL_SAMPLES = 20
+TRAIN_SAMPLES = 1000
+VAL_SAMPLES = 200
 DURATION_FRAMES = 60
-MAX_NUM_OBJECTS = 3
+MAX_NUM_OBJECTS = 1
 
 # Map sensor names to integer IDs
 SENSOR_MAP = {

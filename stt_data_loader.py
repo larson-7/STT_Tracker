@@ -73,9 +73,8 @@ class TrackingDataset(Dataset):
 
     def __getitem__(self, idx):
         ep_id, frame_seq = self.data_indices[idx]
-        actual_len = len(frame_seq)
 
-        # Pre-allocate fixed-size tensors [seq_len, max_objs, features]
+        # Pre-allocate tensors
         obs_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step, self.feature_dim),
             dtype=torch.float32,
@@ -86,6 +85,7 @@ class TrackingDataset(Dataset):
         truth_id_tensor = torch.full(
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
         ).to(self.device)
+
         prior_truth_states_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step, self.feature_dim),
             dtype=torch.float32,
@@ -101,18 +101,17 @@ class TrackingDataset(Dataset):
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
         ).to(self.device)
 
-        # Track which time-steps in the sequence are real data vs padding
-        valid_seq_mask = torch.zeros(self.seq_len, dtype=torch.bool).to(self.device)
-
-        # Pre-allocate ownship to ensure it's always seq_len long
         batched_own = torch.zeros((self.seq_len, 6), dtype=torch.float32).to(
             self.device
         )
+        valid_seq_mask = torch.zeros(self.seq_len, dtype=torch.bool).to(self.device)
+
+        # Dictionary to store the LAST known state for every Truth ID encountered
+        # Format: { truth_id: torch.Tensor(state) }
+        last_known_truth_states = {}
 
         for t, f_idx in enumerate(frame_seq):
-            valid_seq_mask[t] = True  # Mark this timestep as real data
-
-            # --- Load Detections (Tracks) ---
+            valid_seq_mask[t] = True
             curr_tracks = self.tracks_df[
                 (self.tracks_df["episode_id"] == ep_id)
                 & (self.tracks_df["frame_idx"] == f_idx)
@@ -123,7 +122,7 @@ class TrackingDataset(Dataset):
                 feats = curr_tracks[
                     ["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"]
                 ].values[:num_obs]
-                obs_tensor[t, :num_obs, :] = torch.from_numpy(feats.astype(np.float32))
+                obs_tensor[t, :num_obs] = torch.from_numpy(feats.astype(np.float32))
                 mask_tensor[t, :num_obs] = True
 
                 truth_ids = curr_tracks["truth_id"].values.astype(np.int64)[:num_obs]
@@ -132,34 +131,40 @@ class TrackingDataset(Dataset):
                 sensor_ids = curr_tracks["sensor_id"].values.astype(np.int64)[:num_obs]
                 sensor_id_tensor[t, :num_obs] = torch.from_numpy(sensor_ids)
 
-            # --- Load Truth States ---
-            truth_states = self.truth_df[
+            truth_subset = self.truth_df[
                 (self.truth_df["episode_id"] == ep_id)
                 & (self.truth_df["frame_idx"] == f_idx)
             ]
-            num_truth_objs = min(len(truth_states), self.max_num_detects_per_step)
-            self.max_num_truth_objs = max(self.max_num_truth_objs, num_truth_objs)
+
+            num_truth_objs = min(len(truth_subset), self.max_num_detects_per_step)
 
             if num_truth_objs > 0:
-                truth_feats = truth_states[
+                # Get the IDs and Features for this specific frame
+                current_ids = truth_subset["object_id"].values[:num_truth_objs]
+                current_feats = truth_subset[
                     ["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"]
                 ].values[:num_truth_objs]
 
-                if t > 0:
-                    prior_truth_states_tensor[t, :num_truth_objs, :] = (
-                        posterior_truth_states_tensor[t - 1, :num_truth_objs, :]
-                    )
-                else:
-                    prior_truth_states_tensor[t, :num_truth_objs, :] = torch.from_numpy(
-                        truth_feats.astype(np.float32)
-                    )
+                for i in range(num_truth_objs):
+                    tid = current_ids[i]
+                    feat_vec = torch.from_numpy(current_feats[i].astype(np.float32))
 
-                posterior_truth_states_tensor[t, :num_truth_objs, :] = torch.from_numpy(
-                    truth_feats.astype(np.float32)
-                )
-                truth_mask_tensor[t, :num_truth_objs] = True
+                    # Fill Posterior (Current State)
+                    posterior_truth_states_tensor[t, i] = feat_vec
+                    truth_mask_tensor[t, i] = True
 
-            # --- Load Ownship ---
+                    # Fill Prior (Previous State)
+                    if tid in last_known_truth_states:
+                        # If we saw this object before, use its previous state
+                        prior_truth_states_tensor[t, i] = last_known_truth_states[tid]
+                    else:
+                        # If this is the FIRST time we see this object, Prior = Posterior (or 0 velocity)
+                        # Setting Prior = Posterior effectively creates a "zero error" for the first step
+                        prior_truth_states_tensor[t, i] = feat_vec
+
+                    # Update the cache for the NEXT timestep
+                    last_known_truth_states[tid] = feat_vec
+
             curr_own = self.own_df[
                 (self.own_df["episode_id"] == ep_id)
                 & (self.own_df["frame_idx"] == f_idx)
@@ -177,5 +182,5 @@ class TrackingDataset(Dataset):
             "posterior_truth_states": posterior_truth_states_tensor,
             "truth_mask": truth_mask_tensor,
             "ownship": batched_own,
-            "valid_seq_mask": valid_seq_mask,  # used for loss masking
+            "valid_seq_mask": valid_seq_mask,
         }
