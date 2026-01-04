@@ -15,6 +15,8 @@ from scipy.optimize import linear_sum_assignment
 from models.stt import STTTracker
 from stt_data_loader import TrackingDataset
 
+GAMMA, LAMBDA, ALPHA = 2.0, 1.0, 1.0
+
 
 def get_curriculum_weights(epoch, device):
     weights = torch.tensor(
@@ -104,16 +106,22 @@ def log_xy_plot(
         gt_colors[gt_idx] = c
         px, py = gt_x[:, gt_idx], gt_y[:, gt_idx]
 
+        # Plot the line
         ax.plot(
             px,
             py,
             color=c,
-            marker="o",
+            marker=".",  # Revert to dot for the path itself
             markersize=4,
             alpha=0.5,
             linewidth=2,
             label=f"GT {gt_idx}",
         )
+        # Add Star at Start
+        ax.scatter(
+            px[0], py[0], color=c, marker="*", s=100, edgecolors="black", zorder=5
+        )
+
         ax.text(px[-1], py[-1], f"GT{gt_idx}", color=c, fontsize=9, fontweight="bold")
 
     # Plot Predictions
@@ -148,6 +156,7 @@ def log_xy_plot(
             line_style = ":"
             alpha_val = 0.4
 
+        # Plot line with triangles
         ax.plot(
             px,
             py,
@@ -157,6 +166,11 @@ def log_xy_plot(
             linestyle=line_style,
             alpha=alpha_val,
             label="Predictions" if slot_idx == 0 else "",
+        )
+
+        # Add Star at Start for Prediction
+        ax.scatter(
+            px[0], py[0], color=color, marker="*", s=100, edgecolors="black", zorder=5
         )
 
     # Plot Detections
@@ -234,7 +248,12 @@ def train_one_epoch(
     for batch_idx, batch_data in pbar:
         gt_prior_states = batch_data["prior_truth_states"].to(device)
         gt_posterior_states = batch_data["posterior_truth_states"].to(device)
-        truth_ids = batch_data["truth_ids"].to(device)
+        # truth_ids = IDs coming from the Detections (obs_features)
+        det_truth_ids = batch_data["truth_ids"].to(device)
+        # gt_ids = IDs coming from the Ground Truth (posterior_truth_states)
+        # This is critical for calculating loss during gaps of no detections
+        gt_object_ids = batch_data["gt_ids"].to(device)
+
         valid_mask = batch_data["valid_seq_mask"].to(device)
 
         outputs = model(batch_data)
@@ -245,6 +264,8 @@ def train_one_epoch(
 
         batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
         max_detects = pred_assoc_logits.shape[-1]
+
+        # Track assignments persist across the sequence
         track_assignments = torch.full(
             (batch_size, num_track_slots), -1, dtype=torch.long
         ).to(device)
@@ -260,41 +281,39 @@ def train_one_epoch(
         total_active_slot_steps = 1e-6
 
         for t in range(seq_len):
-            current_frame_truth_ids = truth_ids[:, t]
             is_step_valid = valid_mask[:, t] > 0
+
+            # Only train association on objects the sensor ACTUALLY saw.
+            current_det_ids = det_truth_ids[:, t]
             target_assoc_map = torch.zeros_like(pred_assoc_logits[:, :, t, :])
-            active_slot_mask = torch.zeros((batch_size, num_track_slots), device=device)
-            aligned_gt_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
-            aligned_gt_posterior = torch.zeros_like(posterior_pred_states[:, :, t, :])
 
             for b in range(batch_size):
                 if not is_step_valid[b]:
                     continue
-                valid_gt_indices = (
-                    (current_frame_truth_ids[b] != -1).nonzero().squeeze(-1)
-                )
-                for gt_idx in valid_gt_indices:
-                    tid = current_frame_truth_ids[b, gt_idx].item()
+
+                # Identify valid detections in this frame
+                valid_det_indices = (current_det_ids[b] != -1).nonzero().squeeze(-1)
+                for det_idx in valid_det_indices:
+                    tid = current_det_ids[b, det_idx].item()
+
+                    # Try to find existing slot for this ID
                     slot_idx = (track_assignments[b] == tid).nonzero()
                     if len(slot_idx) > 0:
                         slot_idx = slot_idx[0].item()
                     else:
+                        # Assign new slot if available
                         free_slots = (track_assignments[b] == -1).nonzero()
                         if len(free_slots) > 0:
                             slot_idx = free_slots[0].item()
                             track_assignments[b, slot_idx] = tid
                         else:
-                            continue
-                    if gt_idx < max_detects:
-                        target_assoc_map[b, slot_idx, gt_idx] = 1.0
-                    aligned_gt_prior[b, slot_idx] = gt_prior_states[b, t, gt_idx]
-                    aligned_gt_posterior[b, slot_idx] = gt_posterior_states[
-                        b, t, gt_idx
-                    ]
-                    active_slot_mask[b, slot_idx] = 1.0
+                            continue  # No slots left
 
-            active_slot_mask = active_slot_mask * is_step_valid.unsqueeze(-1).float()
+                    # Set the target: This slot SHOULD associate with this detection index
+                    if det_idx < max_detects:
+                        target_assoc_map[b, slot_idx, det_idx] = 1.0
 
+            # Calculate Association Loss
             loss_assoc = F.binary_cross_entropy_with_logits(
                 pred_assoc_logits[:, :, t, :], target_assoc_map, reduction="none"
             )
@@ -305,8 +324,35 @@ def train_one_epoch(
             pred_assoc_binary = (pred_assoc_logits[:, :, t, :] > 0.0).float()
             acc_assoc = (pred_assoc_binary == target_assoc_map).float().mean(dim=(1, 2))
             batch_metric_assoc_acc_sum += (acc_assoc * is_step_valid.float()).sum()
-
             total_valid_assoc_steps += is_step_valid.sum()
+
+            # Calculate loss against the GT object, even if it wasn't detected
+            current_gt_ids = gt_object_ids[:, t]
+
+            active_slot_mask = torch.zeros((batch_size, num_track_slots), device=device)
+            aligned_gt_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
+            aligned_gt_posterior = torch.zeros_like(posterior_pred_states[:, :, t, :])
+
+            for b in range(batch_size):
+                if not is_step_valid[b]:
+                    continue
+
+                # Iterate over all Ground Truths present in the scene
+                valid_gt_indices = (current_gt_ids[b] != -1).nonzero().squeeze(-1)
+                for gt_idx in valid_gt_indices:
+                    tid = current_gt_ids[b, gt_idx].item()
+
+                    # Check if we have a track currently assigned to this ID
+                    slot_idx = (track_assignments[b] == tid).nonzero()
+                    if len(slot_idx) > 0:
+                        slot_idx = slot_idx[0].item()
+
+                        # Still penalize the model if its prediction drifts from GT.
+                        aligned_gt_prior[b, slot_idx] = gt_prior_states[b, t, gt_idx]
+                        aligned_gt_posterior[b, slot_idx] = gt_posterior_states[
+                            b, t, gt_idx
+                        ]
+                        active_slot_mask[b, slot_idx] = 1.0
 
             num_active = active_slot_mask.sum()
             if num_active > 0:
@@ -343,11 +389,10 @@ def train_one_epoch(
         final_posterior_loss = batch_loss_posterior_sum / total_active_slot_steps
         final_mae = batch_metric_post_mae_sum / total_active_slot_steps
 
-        gamma, lam, alpha = 2.0, 1.0, 1.0
         final_loss = (
-            (gamma * final_assoc_loss)
-            + (lam * final_prior_loss)
-            + (alpha * final_posterior_loss)
+            (GAMMA * final_assoc_loss)
+            + (LAMBDA * final_prior_loss)
+            + (ALPHA * final_posterior_loss)
         )
 
         optimizer.zero_grad()
@@ -523,11 +568,10 @@ def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats
             final_posterior_loss = batch_loss_posterior_sum / total_active_slot_steps
             final_posterior_mae = batch_metric_post_mae_sum / total_active_slot_steps
 
-            gamma, lam, alpha = 1.0, 5.0, 2.0
             final_loss = (
-                (gamma * final_assoc_loss)
-                + (lam * final_prior_loss)
-                + (alpha * final_posterior_loss)
+                (GAMMA * final_assoc_loss)
+                + (LAMBDA * final_prior_loss)
+                + (ALPHA * final_posterior_loss)
             )
 
             total_epoch_loss += final_loss.item()

@@ -82,7 +82,14 @@ class TrackingDataset(Dataset):
         mask_tensor = torch.zeros(
             (self.seq_len, self.max_num_detects_per_step), dtype=torch.bool
         ).to(self.device)
+
+        # This tensor holds IDs associated with DETECTIONS (can have gaps/missing IDs)
         truth_id_tensor = torch.full(
+            (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
+        ).to(self.device)
+
+        # This tensor holds IDs associated with GROUND TRUTH (no gaps if object exists)
+        gt_ids_tensor = torch.full(
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
         ).to(self.device)
 
@@ -122,7 +129,7 @@ class TrackingDataset(Dataset):
                 feats = curr_tracks[
                     ["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"]
                 ].values[:num_obs]
-                obs_tensor[t, :num_obs] = torch.from_numpy(feats.astype(np.float32))
+                obs_tensor[t, :num_obs, :] = torch.from_numpy(feats.astype(np.float32))
                 mask_tensor[t, :num_obs] = True
 
                 truth_ids = curr_tracks["truth_id"].values.astype(np.int64)[:num_obs]
@@ -144,6 +151,9 @@ class TrackingDataset(Dataset):
                 current_feats = truth_subset[
                     ["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"]
                 ].values[:num_truth_objs]
+                gt_ids_tensor[t, :num_truth_objs] = torch.from_numpy(
+                    current_ids.astype(np.int64)
+                )
 
                 for i in range(num_truth_objs):
                     tid = current_ids[i]
@@ -153,13 +163,10 @@ class TrackingDataset(Dataset):
                     posterior_truth_states_tensor[t, i] = feat_vec
                     truth_mask_tensor[t, i] = True
 
-                    # Fill Prior (Previous State)
+                    # Fill Prior (Previous State) using ID cache
                     if tid in last_known_truth_states:
-                        # If we saw this object before, use its previous state
                         prior_truth_states_tensor[t, i] = last_known_truth_states[tid]
                     else:
-                        # If this is the FIRST time we see this object, Prior = Posterior (or 0 velocity)
-                        # Setting Prior = Posterior effectively creates a "zero error" for the first step
                         prior_truth_states_tensor[t, i] = feat_vec
 
                     # Update the cache for the NEXT timestep
@@ -178,6 +185,7 @@ class TrackingDataset(Dataset):
             "obs_ids": sensor_id_tensor,
             "obs_mask": mask_tensor,
             "truth_ids": truth_id_tensor,
+            "gt_ids": gt_ids_tensor,
             "prior_truth_states": prior_truth_states_tensor,
             "posterior_truth_states": posterior_truth_states_tensor,
             "truth_mask": truth_mask_tensor,
