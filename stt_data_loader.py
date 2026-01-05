@@ -87,6 +87,9 @@ class TrackingDataset(Dataset):
         truth_id_tensor = torch.full(
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
         ).to(self.device)
+        gt_existence_tensor = torch.zeros(
+            (self.seq_len, self.max_num_detects_per_step, 1), dtype=torch.float32
+        ).to(self.device)
 
         # This tensor holds IDs associated with GROUND TRUTH (no gaps if object exists)
         gt_ids_tensor = torch.full(
@@ -154,6 +157,7 @@ class TrackingDataset(Dataset):
                 gt_ids_tensor[t, :num_truth_objs] = torch.from_numpy(
                     current_ids.astype(np.int64)
                 )
+                gt_existence_tensor[t, :num_truth_objs] = 1.0
 
                 for i in range(num_truth_objs):
                     tid = current_ids[i]
@@ -186,6 +190,7 @@ class TrackingDataset(Dataset):
             "obs_mask": mask_tensor,
             "truth_ids": truth_id_tensor,
             "gt_ids": gt_ids_tensor,
+            "gt_existence": gt_existence_tensor,
             "prior_truth_states": prior_truth_states_tensor,
             "posterior_truth_states": posterior_truth_states_tensor,
             "truth_mask": truth_mask_tensor,

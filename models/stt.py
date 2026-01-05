@@ -259,6 +259,9 @@ class TrackStateDecoder(nn.Module):
         )
         self.state_head = nn.Linear(hidden_dim // 2, state_dim)
         self.log_var_head = nn.Linear(hidden_dim // 2, state_dim)
+        self.existence_head = nn.Linear(
+            hidden_dim // 2, 1
+        )  # Output: 1 logit (is this track alive?)
 
         # Initialize log_var head to predict small variances initially
         torch.nn.init.constant_(self.log_var_head.weight, 0)
@@ -272,10 +275,11 @@ class TrackStateDecoder(nn.Module):
         kinematics = self.state_head(features)
         log_variance = self.log_var_head(features)
         log_variance = torch.clamp(log_variance, min=-10.0, max=10.0)
+        existence_logits = self.existence_head(features)
 
         variance = torch.exp(log_variance)
 
-        return kinematics, variance
+        return kinematics, variance, existence_logits
 
 
 class STTTracker(nn.Module):
@@ -410,6 +414,7 @@ class STTTracker(nn.Module):
         all_posterior_kinematics = []
         all_posterior_variances = []
         all_association_scores = []
+        all_posterior_track_active_logits = []
 
         for t in range(seq_len):
             current_context = encoded_dets_expanded[:, t, :, :]
@@ -428,20 +433,21 @@ class STTTracker(nn.Module):
                 )
                 track_query = track_query.unsqueeze(1)
 
-            prior_kin, prior_var = self.prior_state_decoder(track_query)
+            prior_kin, prior_var, _ = self.prior_state_decoder(track_query)
 
             updated_embedding, assoc_score, _ = self.tdi_module(
                 track_query, current_context, key_padding_mask=current_padding_mask
             )
 
-            posterior_kin, posterior_var = self.posterior_state_decoder(
-                updated_embedding
+            posterior_kin, posterior_var, posterior_track_active_logits = (
+                self.posterior_state_decoder(updated_embedding)
             )
 
             all_prior_kinematics.append(prior_kin.squeeze(1))
             all_prior_variances.append(prior_var.squeeze(1))
             all_posterior_kinematics.append(posterior_kin.squeeze(1))
             all_posterior_variances.append(posterior_var.squeeze(1))
+            all_posterior_track_active_logits.append(posterior_var.squeeze(1))
             all_association_scores.append(assoc_score.squeeze(1))
 
             if track_history is None:
@@ -458,6 +464,9 @@ class STTTracker(nn.Module):
         prior_variances_stacked = torch.stack(all_prior_variances, dim=1)
         posterior_kinematics_stacked = torch.stack(all_posterior_kinematics, dim=1)
         posterior_variance_stacked = torch.stack(all_posterior_variances, dim=1)
+        posterior_track_active_logits_stacked = torch.stack(
+            all_posterior_track_active_logits, dim=1
+        )
         scores_stacked = torch.stack(all_association_scores, dim=1)
 
         def unfold(tensor):
@@ -469,6 +478,7 @@ class STTTracker(nn.Module):
             "prior_variance": unfold(prior_variances_stacked),
             "posterior_kinematics": unfold(posterior_kinematics_stacked),
             "posterior_variance": unfold(posterior_variance_stacked),
+            "posterior_existence_logits": unfold(posterior_track_active_logits_stacked),
             "association_scores": unfold(scores_stacked),
         }
 
