@@ -13,7 +13,7 @@ class TrackingDataset(Dataset):
         seq_len=5,
         max_num_detects_per_step=3,
         device: torch.device | str = "cpu",
-        # Allow passing pre-computed stats so Train and Val use SAME scaling
+        # Allow passing pre-computed stats so Train and Val use same scaling
         stats: dict | None = None,
     ):
         self.seq_len = seq_len
@@ -30,14 +30,12 @@ class TrackingDataset(Dataset):
         cols_to_scale = ["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"]
 
         if stats is None:
-            # Calculate Mean and Std from Truth (most reliable source)
-            # You could also concatenate tracks_df + truth_df to get global stats
+            # Calculate Mean and Std from Truth
             print("Computing normalization statistics from training data...")
             self.stats = {}
             for c in cols_to_scale:
                 mean = self.truth_df[c].mean()
                 std = self.truth_df[c].std()
-                # Avoid division by zero for constant columns (like Z often is)
                 if std < 1e-6:
                     std = 1.0
                 self.stats[c] = {"mean": mean, "std": std}
@@ -83,7 +81,7 @@ class TrackingDataset(Dataset):
             (self.seq_len, self.max_num_detects_per_step), dtype=torch.bool
         ).to(self.device)
 
-        # This tensor holds IDs associated with DETECTIONS (can have gaps/missing IDs)
+        # holds IDs associated with detections (gaps can occur)
         truth_id_tensor = torch.full(
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
         ).to(self.device)
@@ -91,7 +89,7 @@ class TrackingDataset(Dataset):
             (self.seq_len, self.max_num_detects_per_step, 1), dtype=torch.float32
         ).to(self.device)
 
-        # This tensor holds IDs associated with GROUND TRUTH (no gaps if object exists)
+        # holds IDs associated with ground truths (no gaps)
         gt_ids_tensor = torch.full(
             (self.seq_len, self.max_num_detects_per_step), -1, dtype=torch.long
         ).to(self.device)
@@ -116,8 +114,7 @@ class TrackingDataset(Dataset):
         )
         valid_seq_mask = torch.zeros(self.seq_len, dtype=torch.bool).to(self.device)
 
-        # Dictionary to store the LAST known state for every Truth ID encountered
-        # Format: { truth_id: torch.Tensor(state) }
+        # Dictionary to store the last known state for every Truth ID encountered
         last_known_truth_states = {}
 
         for t, f_idx in enumerate(frame_seq):
@@ -173,7 +170,7 @@ class TrackingDataset(Dataset):
                     else:
                         prior_truth_states_tensor[t, i] = feat_vec
 
-                    # Update the cache for the NEXT timestep
+                    # Update the cache for the next timestep
                     last_known_truth_states[tid] = feat_vec
 
             curr_own = self.own_df[

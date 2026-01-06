@@ -185,7 +185,7 @@ class TrackDetectionInteraction(nn.Module):
         # Expand null token to batch size: [B, 1, C]
         null_obs = self.null_obs_embedding.expand(B, -1, -1)
 
-        # Concatenate null token to the END of detections
+        # Concatenate null token to the end of detections
         # New shape: [B, N_dets + 1, C]
         context_with_null = torch.cat([context_detections, null_obs], dim=1)
 
@@ -226,7 +226,6 @@ class TrackDetectionInteraction(nn.Module):
             mask_expanded = key_padding_mask_with_null.view(B, 1, 1, N_dets + 1)
             attn_logits = attn_logits.masked_fill(mask_expanded, NEAR_NEG_INF)
 
-        # If all real detections have low logits, probability flows to the Null index.
         attn_weights = F.softmax(attn_logits, dim=-1)
 
         out = attn_weights @ v
@@ -447,7 +446,9 @@ class STTTracker(nn.Module):
             all_prior_variances.append(prior_var.squeeze(1))
             all_posterior_kinematics.append(posterior_kin.squeeze(1))
             all_posterior_variances.append(posterior_var.squeeze(1))
-            all_posterior_track_active_logits.append(posterior_var.squeeze(1))
+            all_posterior_track_active_logits.append(
+                posterior_track_active_logits.squeeze(1)
+            )
             all_association_scores.append(assoc_score.squeeze(1))
 
             if track_history is None:

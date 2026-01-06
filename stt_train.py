@@ -10,11 +10,10 @@ import numpy as np
 import os
 from datetime import datetime
 
-# Your custom imports
 from models.stt import STTTracker
 from stt_data_loader import TrackingDataset
 
-# --- HYPERPARAMETERS ---
+# Hyperparams
 GAMMA = 2.0  # Association
 LAMBDA = 1.0  # Prior Kinematics
 ALPHA = 1.0  # Posterior Kinematics
@@ -36,7 +35,7 @@ BATCH_SIZE = 20
 MAX_SEQUENCE_LENGTH = 60
 NUM_SENSOR_MODALITIES = 3
 MAX_NUM_DETECTS_PER_STEP = NUM_SENSOR_MODALITIES**2
-MAX_NUM_TRACK_SLOTS = 3
+MAX_NUM_TRACK_SLOTS = 10
 DETECT_NUM_DIMS = 9
 SENSOR_TYPE_EMBEDDING_DIM = 8
 EMBEDDING_DIM = 256

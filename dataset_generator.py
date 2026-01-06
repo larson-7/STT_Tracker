@@ -26,7 +26,7 @@ OUTPUT_DIR = "data"
 TRAIN_SAMPLES = 1000
 VAL_SAMPLES = 200
 DURATION_FRAMES = 60
-MAX_NUM_OBJECTS = 3
+MAX_NUM_OBJECTS = 6
 
 # Map sensor names to integer IDs
 SENSOR_MAP = {
@@ -240,7 +240,6 @@ def run_sanity_episode(episode_id, start_time, duration):
     episode_ownship_rows = []
 
     # Random Start Position (Intercept 'b')
-    # We keep z higher to simulate an aerial or distinct object
     start_x = np.random.uniform(-50, 50)
     start_y = np.random.uniform(-50, 50)
     start_z = np.random.uniform(20, 80)
@@ -348,8 +347,6 @@ def run_episode(
 
     for k in range(duration):
         current_time = start_time + timedelta(seconds=k)
-
-        # Access state safely
         ownship_state = ownship_path[k]
 
         # Ownship Data
