@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 from datetime import datetime
+from scipy.optimize import linear_sum_assignment
 
 from models.stt import STTTracker
 from stt_data_loader import TrackingDataset
@@ -28,7 +29,7 @@ VAL_TRUTH = "data/val_truth.csv"
 VAL_OWN = "data/val_ownship.csv"
 MODEL_CHECKPOINT_DIR = "checkpoint"
 LOG_DIR = "runs/stt"
-MODEL_INIT_WEIGHTS_PATH = ""
+MODEL_INIT_WEIGHTS_PATH = "/home/jordan/eng/STT_Tracker/checkpoint/hungarian_chkpnt.pth"
 
 # Model Params
 BATCH_SIZE = 20
@@ -39,7 +40,10 @@ MAX_NUM_TRACK_SLOTS = 10
 DETECT_NUM_DIMS = 9
 SENSOR_TYPE_EMBEDDING_DIM = 8
 EMBEDDING_DIM = 256
-NUM_EPOCHS = 1000
+NUM_EPOCHS = 500
+NUM_DIST_THRESHOLD_DIMS = 3
+COST_W_DIST = 5.0
+COST_W_EXIST = 2.0
 
 
 def sigmoid_focal_loss(
@@ -259,11 +263,6 @@ def train_one_epoch(
     total_epoch_loss = 0
     l1_loss_fn = nn.L1Loss(reduction="none")
     loss_weights = get_curriculum_weights(epoch_index, device)
-
-    if epoch_index % 5 == 0:
-        writer.add_scalar("Weights/Position", loss_weights[0], epoch_index)
-        writer.add_scalar("Weights/Velocity", loss_weights[3], epoch_index)
-
     pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Train Ep {epoch_index}")
 
     for batch_idx, batch_data in pbar:
@@ -282,9 +281,6 @@ def train_one_epoch(
 
         batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
         max_detects = pred_assoc_logits.shape[-1]
-        track_assignments = torch.full(
-            (batch_size, num_track_slots), -1, dtype=torch.long
-        ).to(device)
 
         batch_loss_assoc = 0.0
         batch_loss_exist = 0.0
@@ -299,33 +295,44 @@ def train_one_epoch(
 
         for t in range(seq_len):
             is_step_valid = valid_mask[:, t] > 0
-            current_det_ids = det_truth_ids[:, t]
-            current_gt_ids = gt_object_ids[:, t]
-
             target_assoc_map = torch.zeros_like(pred_assoc_logits[:, :, t, :])
             target_exist_map = torch.zeros_like(pred_exist_logits[:, :, t, :])
             active_slot_mask = torch.zeros((batch_size, num_track_slots), device=device)
             aligned_gt_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
             aligned_gt_posterior = torch.zeros_like(posterior_pred_states[:, :, t, :])
 
+            # Get detections for association matching later
+            current_det_ids = det_truth_ids[:, t]
+
             for b in range(batch_size):
                 if not is_step_valid[b]:
                     continue
 
-                valid_gt_indices = (current_gt_ids[b] != -1).nonzero().squeeze(-1)
-                for gt_idx in valid_gt_indices:
-                    tid = current_gt_ids[b, gt_idx].item()
-                    slot_idx = (track_assignments[b] == tid).nonzero()
-                    if len(slot_idx) > 0:
-                        slot_idx = slot_idx[0].item()
-                    else:
-                        free_slots = (track_assignments[b] == -1).nonzero()
-                        if len(free_slots) > 0:
-                            slot_idx = free_slots[0].item()
-                            track_assignments[b, slot_idx] = tid
-                        else:
-                            continue
+                gt_indices = (gt_object_ids[b, t] != -1).nonzero().squeeze(-1)
+                num_gt = len(gt_indices)
 
+                if num_gt == 0:
+                    # If no GT, we just want existence to be 0 (which it is init to)
+                    continue
+                pred_pos = posterior_pred_states[b, :, t, :NUM_DIST_THRESHOLD_DIMS]
+                pred_prob = torch.sigmoid(pred_exist_logits[b, :, t, 0])
+                gt_pos = gt_posterior_states[b, t, gt_indices][
+                    :, :NUM_DIST_THRESHOLD_DIMS
+                ]
+
+                cost_dist = torch.cdist(pred_pos, gt_pos, p=1)
+
+                # Existence Cost (We want high prob for matched objects)
+                cost_exist = -pred_prob.unsqueeze(-1).repeat(1, num_gt)
+                final_cost = (COST_W_DIST * cost_dist) + (COST_W_EXIST * cost_exist)
+                final_cost_np = final_cost.detach().cpu().numpy()
+
+                # Hungarian Matching
+                row_inds, col_inds = linear_sum_assignment(final_cost_np)
+
+                for row, col in zip(row_inds, col_inds):
+                    slot_idx = row
+                    gt_idx = gt_indices[col]  # Map back to original GT index
                     target_exist_map[b, slot_idx] = 1.0
                     aligned_gt_prior[b, slot_idx] = gt_prior_states[b, t, gt_idx]
                     aligned_gt_posterior[b, slot_idx] = gt_posterior_states[
@@ -333,16 +340,18 @@ def train_one_epoch(
                     ]
                     active_slot_mask[b, slot_idx] = 1.0
 
-                valid_det_indices = (current_det_ids[b] != -1).nonzero().squeeze(-1)
-                for det_idx in valid_det_indices:
-                    tid = current_det_ids[b, det_idx].item()
-                    slot_idx = (track_assignments[b] == tid).nonzero()
-                    if len(slot_idx) > 0:
-                        slot_idx = slot_idx[0].item()
+                    # Association Target (Match Slot to Detections via GT ID)
+                    matched_tid = gt_object_ids[b, t, gt_idx].item()
+
+                    # Find which detections correspond to this Truth ID
+                    det_indices = (
+                        (current_det_ids[b] == matched_tid).nonzero().squeeze(-1)
+                    )
+
+                    for det_idx in det_indices:
                         if det_idx < max_detects:
                             target_assoc_map[b, slot_idx, det_idx] = 1.0
 
-            # Losses
             loss_assoc = F.binary_cross_entropy_with_logits(
                 pred_assoc_logits[:, :, t, :], target_assoc_map, reduction="none"
             )
@@ -483,9 +492,6 @@ def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats
 
             batch_size, num_track_slots, seq_len, _ = pred_assoc_logits.shape
             max_detects = pred_assoc_logits.shape[-1]
-            track_assignments = torch.full(
-                (batch_size, num_track_slots), -1, dtype=torch.long
-            ).to(device)
 
             b_loss_assoc = 0.0
             b_loss_exist = 0.0
@@ -499,43 +505,51 @@ def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats
 
             for t in range(seq_len):
                 is_step_valid = valid_mask[:, t] > 0
-                current_det_ids, current_gt_ids = (
-                    det_truth_ids[:, t],
-                    gt_object_ids[:, t],
-                )
                 target_assoc = torch.zeros_like(pred_assoc_logits[:, :, t, :])
                 target_exist = torch.zeros_like(pred_exist_logits[:, :, t, :])
                 active_mask = torch.zeros((batch_size, num_track_slots), device=device)
                 aligned_prior = torch.zeros_like(prior_pred_states[:, :, t, :])
                 aligned_post = torch.zeros_like(posterior_pred_states[:, :, t, :])
 
+                # Get detections for association matching later
+                current_det_ids = det_truth_ids[:, t]
+
                 for b in range(batch_size):
                     if not is_step_valid[b]:
                         continue
-                    valid_gt = (current_gt_ids[b] != -1).nonzero().squeeze(-1)
-                    for gt_idx in valid_gt:
-                        tid = current_gt_ids[b, gt_idx].item()
-                        slot_idx = (track_assignments[b] == tid).nonzero()
-                        if len(slot_idx) > 0:
-                            slot_idx = slot_idx[0].item()
-                        else:
-                            free = (track_assignments[b] == -1).nonzero()
-                            if len(free) > 0:
-                                slot_idx = free[0].item()
-                                track_assignments[b, slot_idx] = tid
-                            else:
-                                continue
+
+                    gt_indices = (gt_object_ids[b, t] != -1).nonzero().squeeze(-1)
+                    num_gt = len(gt_indices)
+
+                    if num_gt == 0:
+                        continue
+
+                    pred_pos = posterior_pred_states[b, :, t, :3]
+                    pred_prob = torch.sigmoid(pred_exist_logits[b, :, t, 0])
+                    gt_pos = gt_posterior_states[b, t, gt_indices][:, :3]
+
+                    # Compute Cost Matrix
+                    cost_dist = torch.cdist(pred_pos, gt_pos, p=1)
+                    cost_exist = -pred_prob.unsqueeze(-1).repeat(1, num_gt)
+                    final_cost = (COST_W_DIST * cost_dist) + (COST_W_EXIST * cost_exist)
+
+                    # Hungarian Matching
+                    row_inds, col_inds = linear_sum_assignment(final_cost.cpu().numpy())
+
+                    # Build Targets
+                    for row, col in zip(row_inds, col_inds):
+                        slot_idx = row
+                        gt_idx = gt_indices[col]
                         target_exist[b, slot_idx] = 1.0
                         aligned_prior[b, slot_idx] = gt_prior_states[b, t, gt_idx]
                         aligned_post[b, slot_idx] = gt_posterior_states[b, t, gt_idx]
                         active_mask[b, slot_idx] = 1.0
 
-                    valid_det = (current_det_ids[b] != -1).nonzero().squeeze(-1)
-                    for det_idx in valid_det:
-                        tid = current_det_ids[b, det_idx].item()
-                        slot_idx = (track_assignments[b] == tid).nonzero()
-                        if len(slot_idx) > 0:
-                            slot_idx = slot_idx[0].item()
+                        matched_tid = gt_object_ids[b, t, gt_idx].item()
+                        det_indices = (
+                            (current_det_ids[b] == matched_tid).nonzero().squeeze(-1)
+                        )
+                        for det_idx in det_indices:
                             if det_idx < max_detects:
                                 target_assoc[b, slot_idx, det_idx] = 1.0
 
@@ -558,11 +572,13 @@ def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats
                     (pred_assoc_bin == target_assoc).float().mean(dim=(1, 2))
                     * is_step_valid.float()
                 ).sum()
+
                 pred_exist_bin = (pred_exist_logits[:, :, t, :] > 0.0).float()
                 b_acc_exist += (
                     (pred_exist_bin == target_exist).float().mean(dim=(1, 2))
                     * is_step_valid.float()
                 ).sum()
+
                 tot_valid += is_step_valid.sum()
 
                 num_act = active_mask.sum()
@@ -588,11 +604,15 @@ def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats
                 )
 
             total_epoch_loss += final_loss.item()
+
+            # --- ACCUMULATE METRICS ---
             avg_assoc_loss += (b_loss_assoc / tot_valid).item()
             avg_exist_loss += (b_loss_exist / tot_valid).item()
             avg_assoc_acc += (b_acc_assoc / tot_valid).item()
             avg_exist_acc += (b_acc_exist / tot_valid).item()
             if tot_active > 0:
+                avg_prior_loss += (b_loss_prior / tot_active).item()
+                avg_post_loss += (b_loss_post / tot_active).item()
                 avg_mae += (b_mae / tot_active).item()
 
             if batch_idx == 0:
@@ -614,6 +634,10 @@ def validate_one_epoch(model, loader, device, writer, epoch_index, dataset_stats
     writer.add_scalar("Validation/Acc_Exist", avg_exist_acc / loader_len, epoch_index)
     writer.add_scalar("Validation/Loss_Assoc", avg_assoc_loss / loader_len, epoch_index)
     writer.add_scalar("Validation/Acc_Assoc", avg_assoc_acc / loader_len, epoch_index)
+    writer.add_scalar("Validation/Loss_Prior", avg_prior_loss / loader_len, epoch_index)
+    writer.add_scalar(
+        "Validation/Loss_Posterior", avg_post_loss / loader_len, epoch_index
+    )
     writer.add_scalar("Validation/MAE_Posterior", avg_mae / loader_len, epoch_index)
 
     return total_epoch_loss / len(loader)
